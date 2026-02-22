@@ -20,12 +20,19 @@ import type { ToolDefinition, ToolContext } from "./types.js";
 import { getDb } from "../memory/store.js";
 import { lineClient } from "../line.js";
 
+// Lazy import เพื่อหลีกเลี่ยง circular dependency: cron → ai → tools/index → cron
+async function lazyChat(userId: string, message: string) {
+  const { chat } = await import("../ai.js");
+  return chat(userId, message);
+}
+
 // ===== Types =====
 interface CronJob {
   id: string;
   name: string;
   schedule: string;
   schedule_type: "cron" | "once";
+  task_type: "text" | "ai";    // text = push text, ai = spawn full AI chat with tools
   message: string;
   target_user_id: string;
   timezone: string;
@@ -90,21 +97,65 @@ function ensureCronTable(dataDir: string): void {
   if (!colNames.has("run_count")) db.exec("ALTER TABLE cron_jobs ADD COLUMN run_count INTEGER DEFAULT 0");
   if (!colNames.has("last_status")) db.exec("ALTER TABLE cron_jobs ADD COLUMN last_status TEXT");
   if (!colNames.has("last_error")) db.exec("ALTER TABLE cron_jobs ADD COLUMN last_error TEXT");
+  if (!colNames.has("task_type")) db.exec("ALTER TABLE cron_jobs ADD COLUMN task_type TEXT NOT NULL DEFAULT 'text'");
 
   tableReady = true;
 }
 
 // ===== Job execution =====
 async function executeJob(job: CronJob, dataDir: string): Promise<{ success: boolean; error?: string }> {
-  console.log(`[cron] Executing job "${job.name}" → ${job.target_user_id}`);
+  const taskType = job.task_type || "text";
+  console.log(`[cron] Executing job "${job.name}" [${taskType}] → ${job.target_user_id}`);
   const db = getDb(dataDir);
   const startedAt = new Date().toISOString();
 
   try {
-    await lineClient.pushMessage({
-      to: job.target_user_id,
-      messages: [{ type: "text", text: `⏰ ${job.message}` }],
-    });
+    if (taskType === "ai") {
+      // ===== AI mode: spawn full AI chat with tools (เหมือน OpenClaw agentTurn) =====
+      // AI จะได้รับ message เป็น prompt → ใช้ tools ได้ทุกตัว (web_search, image, message push_image, ฯลฯ)
+      // ผลลัพธ์ส่งกลับ user ผ่าน LINE push
+      const result = await lazyChat(job.target_user_id, `[Scheduled Task: ${job.name}]\n${job.message}`);
+
+      // Send AI response text
+      const messages: Array<Record<string, unknown>> = [];
+
+      if (result.text) {
+        messages.push({ type: "text", text: result.text });
+      }
+
+      // AI อาจ return image (จาก send_image tool)
+      if (result.imageUrl) {
+        messages.push({
+          type: "image",
+          originalContentUrl: result.imageUrl,
+          previewImageUrl: result.imageUrl,
+        });
+      }
+
+      // AI อาจ return audio (จาก tts tool)
+      if (result.audioUrl) {
+        messages.push({
+          type: "audio",
+          originalContentUrl: result.audioUrl,
+          duration: result.audioDuration || 5000,
+        });
+      }
+
+      if (messages.length > 0) {
+        await lineClient.pushMessage({
+          to: job.target_user_id,
+          messages: messages as any,
+        });
+      }
+
+      console.log(`[cron] AI task "${job.name}" completed: ${result.text.substring(0, 100)}...`);
+    } else {
+      // ===== Text mode: send text message directly (เหมือน OpenClaw systemEvent) =====
+      await lineClient.pushMessage({
+        to: job.target_user_id,
+        messages: [{ type: "text", text: `⏰ ${job.message}` }],
+      });
+    }
 
     const completedAt = new Date().toISOString();
 
@@ -222,6 +273,7 @@ function formatJob(j: CronJob): Record<string, unknown> {
     name: j.name,
     schedule: j.schedule,
     scheduleType: j.schedule_type,
+    taskType: j.task_type || "text",
     message: j.message,
     timezone: j.timezone,
     enabled: !!j.enabled,
@@ -239,17 +291,21 @@ function formatJob(j: CronJob): Record<string, unknown> {
 export const cronTool: ToolDefinition = {
   name: "cron",
   description:
-    "Schedule recurring or one-time messages/reminders. Actions: " +
+    "Schedule recurring or one-time tasks. Supports two modes: " +
+    '"text" (default) sends a text message, "ai" spawns a full AI chat with all tools (can search web, send images, analyze data, etc). ' +
+    "Actions: " +
     '"status" to show scheduler health, ' +
     '"list" to show all scheduled jobs, ' +
-    '"add" to create a new job (provide name, schedule, message), ' +
+    '"add" to create a new job (provide name, schedule, message, taskType), ' +
     '"update" to modify an existing job (provide jobId + fields to change), ' +
     '"remove" to delete a job by ID, ' +
     '"run" to trigger a job immediately, ' +
     '"runs" to view execution history for a job (or all jobs), ' +
     '"wake" to re-enable a disabled/paused job and reschedule it. ' +
     'Schedule formats: cron expression (e.g. "0 8 * * *" = daily 8am, "30 18 * * 1-5" = weekdays 6:30pm) or ISO datetime for one-time (e.g. "2026-03-01T09:00"). ' +
-    "Default timezone: Asia/Bangkok. Use this for reminders, alarms, periodic notifications.",
+    "Default timezone: Asia/Bangkok. " +
+    'Use taskType "ai" when the user wants the bot to DO something at scheduled time (find images, summarize news, research topics). ' +
+    'Use taskType "text" for simple reminders/notifications.',
   inputSchema: {
     type: "object" as const,
     properties: {
@@ -285,6 +341,11 @@ export const cronTool: ToolDefinition = {
       enabled: {
         type: "boolean",
         description: 'Enable/disable job (for "update").',
+      },
+      taskType: {
+        type: "string",
+        enum: ["text", "ai"],
+        description: 'Job type: "text" sends a plain message (default), "ai" spawns a full AI chat with all tools (can search, send images, analyze, etc). Use "ai" when the task requires intelligence.',
       },
       deleteAfterRun: {
         type: "boolean",
@@ -337,6 +398,7 @@ export const cronTool: ToolDefinition = {
           const message = typeof input.message === "string" ? input.message.trim() : "";
           const timezone = typeof input.timezone === "string" ? input.timezone.trim() : "Asia/Bangkok";
           const deleteAfterRun = input.deleteAfterRun === true;
+          const taskType = (input.taskType === "ai") ? "ai" as const : "text" as const;
 
           if (!name) return JSON.stringify({ error: "missing_name", message: "name is required." });
           if (!schedule) return JSON.stringify({ error: "missing_schedule", message: "schedule is required." });
@@ -366,7 +428,7 @@ export const cronTool: ToolDefinition = {
           const id = crypto.randomUUID().substring(0, 8);
           const now = new Date().toISOString();
           const job: CronJob = {
-            id, name, schedule, schedule_type: scheduleType, message,
+            id, name, schedule, schedule_type: scheduleType, task_type: taskType, message,
             target_user_id: targetUserId, timezone, enabled: 1,
             delete_after_run: deleteAfterRun ? 1 : 0,
             run_count: 0, last_run_at: null, last_status: null, last_error: null,
@@ -374,9 +436,9 @@ export const cronTool: ToolDefinition = {
           };
 
           db.prepare(`
-            INSERT INTO cron_jobs (id, name, schedule, schedule_type, message, target_user_id, timezone, enabled, delete_after_run, run_count, last_run_at, last_status, last_error, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `).run(id, name, schedule, scheduleType, message, targetUserId, timezone, 1, job.delete_after_run, 0, null, null, null, now);
+            INSERT INTO cron_jobs (id, name, schedule, schedule_type, task_type, message, target_user_id, timezone, enabled, delete_after_run, run_count, last_run_at, last_status, last_error, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(id, name, schedule, scheduleType, taskType, message, targetUserId, timezone, 1, job.delete_after_run, 0, null, null, null, now);
 
           const scheduled = scheduleJob(job, dataDir);
 
@@ -415,6 +477,10 @@ export const cronTool: ToolDefinition = {
           if (typeof input.deleteAfterRun === "boolean") {
             updates.push("delete_after_run = ?");
             values.push(input.deleteAfterRun ? 1 : 0);
+          }
+          if (input.taskType === "text" || input.taskType === "ai") {
+            updates.push("task_type = ?");
+            values.push(input.taskType);
           }
 
           // Schedule change requires re-validation
