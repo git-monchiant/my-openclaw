@@ -13,6 +13,7 @@ import { execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import type { ToolDefinition, ToolContext } from "./types.js";
+import { trackGemini } from "../admin/usage-tracker.js";
 
 // ===== Constants =====
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
@@ -94,8 +95,10 @@ async function geminiTTS(params: {
 
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
+    trackGemini({ endpoint: "tts", model: params.model, status: res.status, error: true });
     throw new Error(`Gemini TTS error (${res.status}): ${detail.slice(0, 500)}`);
   }
+  trackGemini({ endpoint: "tts", model: params.model });
 
   type GeminiAudioResponse = {
     candidates?: Array<{

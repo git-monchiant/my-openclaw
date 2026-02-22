@@ -21,6 +21,7 @@
 import type { ToolDefinition, ToolContext } from "./types.js";
 import { getDb } from "../memory/store.js";
 import { lineClient } from "../line.js";
+import { trackLinePush } from "../admin/usage-tracker.js";
 import crypto from "crypto";
 
 // ===== DB Schema =====
@@ -236,6 +237,7 @@ export const nodesTool: ToolDefinition = {
             ? `${emoji} ${title}\n\n${body}`
             : `${emoji} ${title || body}`;
 
+          trackLinePush(targetUserId, "nodes");
           await lineClient.pushMessage({
             to: targetUserId,
             messages: [{ type: "text", text }],
@@ -251,6 +253,7 @@ export const nodesTool: ToolDefinition = {
           if (!targetUserId) return JSON.stringify({ error: "no_target", message: "No target userId." });
 
           // LINE Quick Reply with location action
+          trackLinePush(targetUserId, "nodes");
           await lineClient.pushMessage({
             to: targetUserId,
             messages: [{

@@ -20,7 +20,7 @@ import { getDb } from "../memory/store.js";
 
 // ===== In-memory log buffer =====
 const LOG_BUFFER_SIZE = 500;
-const logBuffer: Array<{ ts: string; level: string; msg: string }> = [];
+export const logBuffer: Array<{ ts: string; level: string; msg: string }> = [];
 
 // Override console.log/error to capture logs
 const origLog = console.log;
@@ -41,7 +41,7 @@ console.error = (...args: unknown[]) => {
 };
 
 // ===== Runtime config overrides =====
-const configOverrides = new Map<string, string>();
+export const configOverrides = new Map<string, string>();
 
 export function getConfigOverride(key: string): string | undefined {
   return configOverrides.get(key);

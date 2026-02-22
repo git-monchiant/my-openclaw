@@ -18,6 +18,7 @@ import crypto from "crypto";
 import type { ToolDefinition, ToolContext } from "./types.js";
 import { getDb } from "../memory/store.js";
 import { lineClient } from "../line.js";
+import { trackGemini, trackLinePush } from "../admin/usage-tracker.js";
 
 // ===== Types =====
 export interface BackgroundTask {
@@ -193,6 +194,7 @@ async function executeBackgroundTask(
     // Announce result to user
     const shortResult = result.length > 1500 ? result.substring(0, 1500) + "..." : result;
     try {
+      trackLinePush(userId, "spawn");
       await lineClient.pushMessage({
         to: userId,
         messages: [{ type: "text", text: `✅ Task เสร็จแล้ว!\n\n${shortResult}` }],
@@ -217,6 +219,7 @@ async function executeBackgroundTask(
 
     // Notify user about failure
     try {
+      trackLinePush(userId, "spawn");
       await lineClient.pushMessage({
         to: userId,
         messages: [{ type: "text", text: `❌ Task ล้มเหลว: ${errorMsg.substring(0, 200)}` }],
@@ -247,8 +250,17 @@ async function callGeminiSimple(task: string, model: string, signal: AbortSignal
     },
   );
 
-  if (!res.ok) throw new Error(`Gemini ${res.status}: ${await res.text()}`);
+  if (!res.ok) {
+    trackGemini({ endpoint: "spawn", model, status: res.status, error: true });
+    throw new Error(`Gemini ${res.status}: ${await res.text()}`);
+  }
   const json = await res.json() as any;
+  trackGemini({
+    endpoint: "spawn", model,
+    promptTokens: json.usageMetadata?.promptTokenCount,
+    completionTokens: json.usageMetadata?.candidatesTokenCount,
+    totalTokens: json.usageMetadata?.totalTokenCount,
+  });
   return json.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join("\n") || "(no response)";
 }
 

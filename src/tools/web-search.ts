@@ -7,6 +7,7 @@
  */
 
 import type { ToolDefinition } from "./types.js";
+import { trackGemini } from "../admin/usage-tracker.js";
 import {
   type CacheEntry,
   DEFAULT_CACHE_TTL_MINUTES,
@@ -219,8 +220,10 @@ async function runGeminiSearch(params: {
 
   if (!res.ok) {
     const detail = (await readResponseText(res, { maxBytes: 64_000 })).text;
+    trackGemini({ endpoint: "search", model: params.model, status: res.status, error: true });
     throw new Error(`Gemini Search API error (${res.status}): ${detail || res.statusText}`);
   }
+  trackGemini({ endpoint: "search", model: params.model });
 
   const data = (await res.json()) as GeminiSearchResponse;
   const candidate = data.candidates?.[0];

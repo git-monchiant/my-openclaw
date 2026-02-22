@@ -19,6 +19,7 @@ import crypto from "crypto";
 import type { ToolDefinition, ToolContext } from "./types.js";
 import { getDb } from "../memory/store.js";
 import { lineClient, trackPush } from "../line.js";
+import { trackLinePush } from "../admin/usage-tracker.js";
 
 // Lazy import เพื่อหลีกเลี่ยง circular dependency: cron → ai → tools/index → cron
 // skipHistory = true → ไม่โหลด/บันทึก history ป้องกัน context ปนกับ conversation หลัก
@@ -147,6 +148,7 @@ async function executeJob(job: CronJob, dataDir: string): Promise<{ success: boo
 
       if (messages.length > 0) {
         trackPush(job.target_user_id);
+        trackLinePush(job.target_user_id, "cron");
         await lineClient.pushMessage({
           to: job.target_user_id,
           messages: messages as any,
@@ -157,6 +159,7 @@ async function executeJob(job: CronJob, dataDir: string): Promise<{ success: boo
     } else {
       // ===== Text mode: send text message directly (เหมือน OpenClaw systemEvent) =====
       trackPush(job.target_user_id);
+      trackLinePush(job.target_user_id, "cron");
       await lineClient.pushMessage({
         to: job.target_user_id,
         messages: [{ type: "text", text: `⏰ ${job.message}` }],

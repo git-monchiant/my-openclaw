@@ -12,6 +12,7 @@
 import type { ToolDefinition, ToolContext } from "./types.js";
 import { lineClient } from "../line.js";
 import { getDb } from "../memory/store.js";
+import { trackLinePush } from "../admin/usage-tracker.js";
 
 function isOwner(userId?: string): boolean {
   const ownerIds = process.env.OWNER_USER_ID?.trim();
@@ -62,6 +63,7 @@ export const sessionsSendTool: ToolDefinition = {
     const text = asBot ? `🤖 MyClaw: ${message}` : message;
 
     try {
+      trackLinePush(targetUserId, "sessions-send");
       await lineClient.pushMessage({
         to: targetUserId,
         messages: [{ type: "text", text }],

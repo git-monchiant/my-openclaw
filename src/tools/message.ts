@@ -10,6 +10,7 @@
 
 import type { ToolDefinition, ToolContext } from "./types.js";
 import { getDb } from "../memory/store.js";
+import { trackLinePush } from "../admin/usage-tracker.js";
 
 export const messageTool: ToolDefinition = {
   name: "message",
@@ -81,6 +82,7 @@ export const messageTool: ToolDefinition = {
             return JSON.stringify({ error: "missing_message", message: "Message text is required for push." });
           }
 
+          trackLinePush(targetUserId, "message");
           await client.pushMessage({
             to: targetUserId,
             messages: [{ type: "text", text: message }],
@@ -99,6 +101,7 @@ export const messageTool: ToolDefinition = {
 
           const previewUrl = (typeof input.previewUrl === "string" && input.previewUrl.trim()) || imageUrl;
 
+          trackLinePush(targetUserId, "message");
           await client.pushMessage({
             to: targetUserId,
             messages: [{
@@ -167,6 +170,7 @@ export const messageTool: ToolDefinition = {
           for (let i = 0; i < userIds.length; i += batchSize) {
             const batch = userIds.slice(i, i + batchSize);
             try {
+              for (const uid of batch) trackLinePush(uid, "message");
               await client.multicast({
                 to: batch,
                 messages: [{ type: "text", text: message }],
@@ -208,6 +212,7 @@ export const messageTool: ToolDefinition = {
           }
 
           try {
+            for (const uid of userIds) trackLinePush(uid, "message");
             await client.multicast({
               to: userIds,
               messages: [{ type: "text", text: message }],

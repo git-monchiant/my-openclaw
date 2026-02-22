@@ -15,6 +15,7 @@
 
 import type { ToolDefinition } from "./types.js";
 import { isPrivateUrl } from "./web-shared.js";
+import { trackGemini } from "../admin/usage-tracker.js";
 
 // ===== Constants =====
 const MAX_MEDIA = 20;
@@ -245,6 +246,7 @@ async function analyzeWithGemini(params: {
 
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
+    trackGemini({ endpoint: "image", model: params.model, status: res.status, error: true });
     throw new Error(`Gemini Vision API error (${res.status}): ${detail.slice(0, 500) || res.statusText}`);
   }
 
@@ -252,9 +254,16 @@ async function analyzeWithGemini(params: {
     candidates?: Array<{
       content?: { parts?: Array<{ text?: string }> };
     }>;
+    usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
   };
 
   const data = (await res.json()) as GeminiResponse;
+  trackGemini({
+    endpoint: "image", model: params.model,
+    promptTokens: data.usageMetadata?.promptTokenCount,
+    completionTokens: data.usageMetadata?.candidatesTokenCount,
+    totalTokens: data.usageMetadata?.totalTokenCount,
+  });
   const textParts = data.candidates?.[0]?.content?.parts
     ?.filter((p) => p.text)
     .map((p) => p.text!) ?? [];

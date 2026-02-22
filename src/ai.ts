@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { getToolDefinitions, executeTool, findTool, type ToolContext } from "./tools/index.js";
 import type { MediaData } from "./media.js";
 import { lineClient } from "./line.js";
+import { trackGemini } from "./admin/usage-tracker.js";
 import {
   saveMessage,
   loadHistory,
@@ -9,35 +10,77 @@ import {
   formatMemoryForPrompt,
   DEFAULT_MEMORY_CONFIG,
 } from "./memory/index.js";
+import { getActiveAgent, getAgentSkills, listSkills } from "./agents/registry.js";
+import type { AgentConfig, SkillConfig } from "./agents/types.js";
 
-// ===== Provider detection =====
-// ลำดับ: GEMINI_API_KEY → OLLAMA_MODEL → ANTHROPIC_API_KEY → none
-const AI_PROVIDER = process.env.GEMINI_API_KEY?.trim()
-  ? "gemini"
-  : process.env.OLLAMA_MODEL?.trim()
-    ? "ollama"
-    : process.env.ANTHROPIC_API_KEY?.trim()
-      ? "anthropic"
-      : "none";
-
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL?.trim() || "http://localhost:11434";
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL?.trim() || "glm-4.7-flash";
-
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim() || "";
-const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
+// ===== Provider detection (dynamic — เปลี่ยนได้จาก admin) =====
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 
-const anthropicClient = AI_PROVIDER === "anthropic" ? new Anthropic() : null;
+function getGeminiKey(): string { return process.env.GEMINI_API_KEY?.trim() || ""; }
+function getGeminiModel(): string { return process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash"; }
+function getOllamaBaseUrl(): string { return process.env.OLLAMA_BASE_URL?.trim() || "http://localhost:11434"; }
+function getOllamaModel(): string { return process.env.OLLAMA_MODEL?.trim() || "glm-4.7-flash"; }
 
-const providerLabel: Record<string, string> = {
-  gemini: `gemini (${GEMINI_MODEL})`,
-  ollama: `ollama (${OLLAMA_MODEL})`,
-  anthropic: "anthropic (claude-sonnet-4)",
-  none: "none",
-};
-console.log(`[AI] Provider: ${providerLabel[AI_PROVIDER]}`);
+// ตรวจว่า provider ไหนพร้อมใช้
+export function getAvailableProviders(): Array<{ id: string; model: string; ready: boolean }> {
+  return [
+    { id: "gemini", model: getGeminiModel(), ready: !!getGeminiKey() },
+    { id: "ollama", model: getOllamaModel(), ready: !!process.env.OLLAMA_MODEL?.trim() },
+    { id: "anthropic", model: "claude-sonnet-4", ready: !!process.env.ANTHROPIC_API_KEY?.trim() },
+  ];
+}
 
-function getSystemPrompt(): string {
+// Primary provider — เปลี่ยนได้ผ่าน AI_PRIMARY_PROVIDER env/override
+function getAIProvider(): string {
+  const forced = process.env.AI_PRIMARY_PROVIDER?.trim();
+  if (forced) {
+    const avail = getAvailableProviders().find((p) => p.id === forced && p.ready);
+    if (avail) return forced;
+  }
+  // Auto-detect ตามลำดับ: gemini → ollama → anthropic → none
+  if (getGeminiKey()) return "gemini";
+  if (process.env.OLLAMA_MODEL?.trim()) return "ollama";
+  if (process.env.ANTHROPIC_API_KEY?.trim()) return "anthropic";
+  return "none";
+}
+
+// Fallback provider (ตัวถัดไปที่พร้อมใช้)
+export function getFallbackProvider(): string | null {
+  const primary = getAIProvider();
+  const avail = getAvailableProviders().filter((p) => p.ready && p.id !== primary);
+  return avail.length > 0 ? avail[0].id : null;
+}
+
+export function getProviderInfo() {
+  const primary = getAIProvider();
+  const fallback = getFallbackProvider();
+  const all = getAvailableProviders();
+  const primaryModel = all.find((p) => p.id === primary)?.model || "none";
+  const fallbackModel = all.find((p) => p.id === fallback)?.model || null;
+  return { primary, primaryModel, fallback, fallbackModel, available: all.filter((p) => p.ready) };
+}
+
+let _anthropicClient: Anthropic | null = null;
+function getAnthropicClient(): Anthropic {
+  if (!_anthropicClient) _anthropicClient = new Anthropic();
+  return _anthropicClient;
+}
+
+function getProviderLabel(provider: string): string {
+  const labels: Record<string, () => string> = {
+    gemini: () => `gemini (${getGeminiModel()})`,
+    ollama: () => `ollama (${getOllamaModel()})`,
+    anthropic: () => "anthropic (claude-sonnet-4)",
+    none: () => "none",
+  };
+  return (labels[provider] || labels.none)();
+}
+console.log(`[AI] Provider: ${getProviderLabel(getAIProvider())}`);
+
+function getSystemPrompt(agent?: AgentConfig, skills?: Array<SkillConfig & { priority: number }>): string {
+  // ถ้า agent มี custom system prompt → ใช้เลย
+  if (agent?.systemPrompt) return agent.systemPrompt;
+
   const now = new Date().toLocaleString("en-GB", {
     timeZone: "Asia/Bangkok",
     weekday: "long",
@@ -47,7 +90,7 @@ function getSystemPrompt(): string {
     hour: "2-digit",
     minute: "2-digit",
   });
-  return `You are MyClaw, a helpful AI assistant on LINE.
+  let base = `You are MyClaw, a helpful AI assistant on LINE.
 Current date/time: ${now} (Asia/Bangkok)
 IMPORTANT: Always reply in the SAME language the user writes in. If the user writes in Thai, reply in Thai only. Never switch to another language.
 Reply concisely. You have access to tools - use them when needed.
@@ -61,6 +104,13 @@ Key capabilities:
 
 Searching:
 Before searching, THINK about what the user actually wants. Consider: the current date/time, what specific content they want, which source they mentioned, and what context is implied. Build a precise search query — vague queries give bad results. If the user mentions a source, include it in the query. If results are wrong, try different keywords — don't just give up or use a different source without telling the user.`;
+
+  // เพิ่ม skill context ให้ AI รู้ว่าทำอะไรได้/ไม่ได้
+  if (skills && skills.length > 0) {
+    const skillList = skills.map((s) => `- ${s.name}: ${s.description}`).join("\n");
+    base += `\n\nYour assigned skills:\n${skillList}\nYou can ONLY use tools related to these skills. If the user asks for something outside your skills, politely explain which capabilities you have and suggest what you can help with instead.`;
+  }
+  return base;
 }
 
 const MAX_HISTORY = 20;
@@ -109,9 +159,33 @@ export interface ChatOptions {
 }
 
 export async function chat(userId: string, message: string, media?: MediaData, options?: ChatOptions): Promise<ChatResult> {
-  if (AI_PROVIDER === "none") {
-    return { text: "ยังไม่ได้ตั้งค่า AI provider กรุณาใส่ GEMINI_API_KEY, OLLAMA_MODEL หรือ ANTHROPIC_API_KEY ใน .env" };
+  const provider = getAIProvider();
+  if (provider === "none") {
+    return { text: "ยังไม่ได้ตั้งค่า AI provider กรุณาใส่ getGeminiKey(), getOllamaModel() หรือ ANTHROPIC_API_KEY ใน .env" };
   }
+
+  // Load active agent config + skills → filter tools
+  let activeAgent: AgentConfig | undefined;
+  let agentSkills: Array<SkillConfig & { priority: number }> = [];
+  let filteredTools = getToolDefinitions(); // default: all tools
+  try {
+    activeAgent = getActiveAgent(memoryConfig.dataDir);
+    agentSkills = getAgentSkills(memoryConfig.dataDir, activeAgent.id);
+
+    // Filter tools ตาม assigned skills
+    if (agentSkills.length > 0) {
+      const allowedToolNames = new Set<string>();
+      for (const skill of agentSkills) {
+        for (const t of skill.tools) allowedToolNames.add(t);
+      }
+      filteredTools = getToolDefinitions().filter((t) => allowedToolNames.has(t.name));
+    } else {
+      filteredTools = []; // ไม่มี skill = ไม่มี tools
+    }
+
+    const skillNames = agentSkills.map((s) => s.name).join(", ");
+    console.log(`[AI] Agent: "${activeAgent.name}" (${activeAgent.provider}/${activeAgent.model}) | Skills: ${skillNames || "none"} | Tools: ${filteredTools.length}`);
+  } catch { /* agent tables not ready yet, use defaults */ }
 
   const skip = options?.skipHistory ?? false;
 
@@ -130,10 +204,11 @@ export async function chat(userId: string, message: string, media?: MediaData, o
     console.error("[memory] Search failed:", err);
   }
 
-  // 3. ประกอบ system prompt + memory context
+  // 3. ประกอบ system prompt + memory context (ใช้ agent's custom prompt + skill context)
+  const basePrompt = getSystemPrompt(activeAgent, agentSkills);
   const fullSystemPrompt = memoryContext
-    ? `${getSystemPrompt()}\n\nNote: The memories below are from PAST conversations and may be outdated. Do NOT confuse them with current facts.\n\n${memoryContext}`
-    : getSystemPrompt();
+    ? `${basePrompt}\n\nNote: The memories below are from PAST conversations and may be outdated. Do NOT confuse them with current facts.\n\n${memoryContext}`
+    : basePrompt;
 
   // บันทึกข้อความ user ลง DB + index เข้า memory
   // ถ้ามี media → รอ AI ตอบก่อน แล้วเก็บ enriched message พร้อม description
@@ -147,24 +222,28 @@ export async function chat(userId: string, message: string, media?: MediaData, o
   _lastAudioResult = undefined;
   _lastImageUrl = undefined;
 
-  console.log(`[AI] Using: ${providerLabel[AI_PROVIDER]}`);
+  console.log(`[AI] Using: ${getProviderLabel(provider)}`);
 
-  if (AI_PROVIDER === "gemini") {
+  if (provider === "gemini") {
     try {
-      reply = await chatGemini(message, dbHistory, fullSystemPrompt, userId, media);
+      reply = await chatGemini(message, dbHistory, fullSystemPrompt, userId, media, filteredTools);
     } catch (err: any) {
-      // Auto-fallback: ถ้า Gemini error → ลองใช้ Ollama แทน (ไม่ส่ง media เพราะ text-only)
-      if (process.env.OLLAMA_MODEL?.trim()) {
-        console.log(`[AI] Gemini failed (${err?.message?.substring(0, 80)}), falling back to Ollama (${OLLAMA_MODEL})`);
-        reply = await chatOllama(message, dbHistory, fullSystemPrompt, userId);
+      // Auto-fallback: ถ้า primary error → ลองใช้ fallback แทน
+      const fb = getFallbackProvider();
+      if (fb === "ollama") {
+        console.log(`[AI] Gemini failed (${err?.message?.substring(0, 80)}), falling back to Ollama (${getOllamaModel()})`);
+        reply = await chatOllama(message, dbHistory, fullSystemPrompt, userId, filteredTools);
+      } else if (fb === "anthropic") {
+        console.log(`[AI] Gemini failed, falling back to Anthropic`);
+        reply = await chatAnthropic(message, dbHistory, fullSystemPrompt, userId, media, filteredTools);
       } else {
         throw err;
       }
     }
-  } else if (AI_PROVIDER === "ollama") {
-    reply = await chatOllama(message, dbHistory, fullSystemPrompt, userId);
+  } else if (provider === "ollama") {
+    reply = await chatOllama(message, dbHistory, fullSystemPrompt, userId, filteredTools);
   } else {
-    reply = await chatAnthropic(message, dbHistory, fullSystemPrompt, userId, media);
+    reply = await chatAnthropic(message, dbHistory, fullSystemPrompt, userId, media, filteredTools);
   }
 
   // ถ้ามี media → เก็บ user message พร้อม AI description/transcript (เหมือน OpenClaw)
@@ -224,9 +303,10 @@ async function chatGemini(
   systemPrompt: string,
   userId: string,
   media?: MediaData,
+  toolDefs?: ReturnType<typeof getToolDefinitions>,
 ): Promise<string> {
   const toolCtx: ToolContext = { userId, lineClient };
-  const toolDefs = getToolDefinitions();
+  if (!toolDefs) toolDefs = getToolDefinitions();
 
   // Gemini format: role = "user" | "model"
   type GeminiPart = { text: string } | { functionCall: { name: string; args: Record<string, unknown> } } | { functionResponse: { name: string; response: { result: string } } } | { inlineData: { mimeType: string; data: string } };
@@ -275,12 +355,12 @@ async function chatGemini(
     };
     if (geminiTools) body.tools = geminiTools;
 
-    const url = `${GEMINI_BASE_URL}/models/${GEMINI_MODEL}:generateContent`;
+    const url = `${GEMINI_BASE_URL}/models/${getGeminiModel()}:generateContent`;
     const res = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY,
+        "x-goog-api-key": getGeminiKey(),
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(60_000), // 60s timeout ป้องกัน hang
@@ -288,6 +368,7 @@ async function chatGemini(
 
     if (!res.ok) {
       const err = await res.text();
+      trackGemini({ endpoint: "chat", model: getGeminiModel(), status: res.status, error: true });
       throw new Error(`Gemini API error: ${res.status} ${err}`);
     }
 
@@ -302,7 +383,15 @@ async function chatGemini(
         };
         finishReason: string;
       }>;
+      usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
     };
+
+    trackGemini({
+      endpoint: "chat", model: getGeminiModel(),
+      promptTokens: json.usageMetadata?.promptTokenCount,
+      completionTokens: json.usageMetadata?.candidatesTokenCount,
+      totalTokens: json.usageMetadata?.totalTokenCount,
+    });
 
     const candidate = json.candidates?.[0];
     if (!candidate) {
@@ -350,9 +439,10 @@ async function chatOllama(
   dbHistory: Array<{ role: string; content: string }>,
   systemPrompt: string,
   userId: string,
+  toolDefs?: ReturnType<typeof getToolDefinitions>,
 ): Promise<string> {
   const toolCtx: ToolContext = { userId, lineClient };
-  const tools = getToolDefinitions();
+  const tools = toolDefs || getToolDefinitions();
 
   const messages: Array<{ role: string; content: string; tool_calls?: unknown[]; tool_call_id?: string }> = [
     { role: "system", content: systemPrompt },
@@ -379,14 +469,14 @@ async function chatOllama(
 
   while (maxLoops-- > 0) {
     const body: Record<string, unknown> = {
-      model: OLLAMA_MODEL,
+      model: getOllamaModel(),
       messages,
       max_tokens: 1024,
       stream: false,
     };
     if (ollamaTools) body.tools = ollamaTools;
 
-    const res = await fetch(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
+    const res = await fetch(`${getOllamaBaseUrl()}/v1/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -466,6 +556,7 @@ async function chatAnthropic(
   systemPrompt: string,
   userId: string,
   media?: MediaData,
+  toolDefs?: ReturnType<typeof getToolDefinitions>,
 ): Promise<string> {
   const toolCtx: ToolContext = { userId, lineClient };
   const history: Anthropic.MessageParam[] = dbHistory
@@ -495,11 +586,11 @@ async function chatAnthropic(
     history.push({ role: "user", content: message });
   }
 
-  const tools = getToolDefinitions();
+  const tools = toolDefs || getToolDefinitions();
 
   let response: Anthropic.Message;
   do {
-    response = await anthropicClient!.messages.create({
+    response = await getAnthropicClient().messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 1024,
       system: systemPrompt,

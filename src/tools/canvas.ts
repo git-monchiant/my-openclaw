@@ -16,6 +16,7 @@
 
 import type { ToolDefinition, ToolContext } from "./types.js";
 import { lineClient } from "../line.js";
+import { trackLinePush } from "../admin/usage-tracker.js";
 
 // ===== Built-in templates =====
 interface FlexTemplate {
@@ -349,6 +350,7 @@ export const canvasTool: ToolDefinition = {
             return JSON.stringify({ error: "no_user", message: "No userId available for sending." });
           }
 
+          trackLinePush(userId, "canvas");
           await lineClient.pushMessage({
             to: userId,
             messages: [flexMessage as any],

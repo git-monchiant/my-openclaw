@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import path from "node:path";
 import { validateSignature, handleWebhook } from "./line.js";
+import { adminRouter } from "./admin/index.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,6 +14,9 @@ app.use("/audio", express.static(path.resolve("./data/audio")));
 app.get("/", (_req, res) => {
   res.json({ status: "MyClaw is running" });
 });
+
+// Admin dashboard
+app.use("/admin", adminRouter);
 
 // LINE webhook endpoint — ใช้ raw body เพื่อ validate signature เอง
 app.post("/webhook", express.raw({ type: "*/*" }), (req, res) => {

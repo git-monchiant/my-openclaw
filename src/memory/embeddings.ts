@@ -8,6 +8,7 @@
 import crypto from "node:crypto";
 import { getCachedEmbedding, setCachedEmbedding, pruneEmbeddingCache } from "./store.js";
 import type { EmbeddingProvider } from "./types.js";
+import { trackGemini } from "../admin/usage-tracker.js";
 
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL?.trim() || "http://localhost:11434";
 const OLLAMA_EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL?.trim() || "";
@@ -39,8 +40,10 @@ function createGeminiProvider(): EmbeddingProvider {
 
       if (!res.ok) {
         const err = await res.text();
+        trackGemini({ endpoint: "embed", model: GEMINI_EMBED_MODEL, status: res.status, error: true });
         throw new Error(`Gemini embedding error: ${res.status} ${err}`);
       }
+      trackGemini({ endpoint: "embed", model: GEMINI_EMBED_MODEL });
 
       const json = (await res.json()) as {
         embedding: { values: number[] };
@@ -68,8 +71,10 @@ function createGeminiProvider(): EmbeddingProvider {
 
       if (!res.ok) {
         const err = await res.text();
+        trackGemini({ endpoint: "embed-batch", model: GEMINI_EMBED_MODEL, status: res.status, error: true });
         throw new Error(`Gemini batch embedding error: ${res.status} ${err}`);
       }
+      trackGemini({ endpoint: "embed-batch", model: GEMINI_EMBED_MODEL });
 
       const json = (await res.json()) as {
         embeddings: Array<{ values: number[] }>;

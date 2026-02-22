@@ -8,6 +8,7 @@
  * Actions:
  * - list: แสดง tasks ทั้งหมด (active + recent)
  * - kill: ยกเลิก task ที่กำลังรัน
+ * - steer: redirect task ด้วย instructions ใหม่ (cancel + restart)
  * - status: ดูรายละเอียดของ task
  */
 
