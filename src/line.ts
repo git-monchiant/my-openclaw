@@ -20,6 +20,22 @@ export const lineClient = new messagingApi.MessagingApiClient({
   channelAccessToken: config.channelAccessToken,
 });
 
+// Track push messages ต่อ user เพื่อตัดสินใจว่าจะ quote reply หรือไม่
+// ถ้ามี push ส่งไปหา user ระหว่างรอ AI ตอบ → ใช้ quote reply เพื่อแยกบริบท
+const _pushCountByUser = new Map<string, number>();
+
+/** เรียกทุกครั้งที่ส่ง push message ไปหา user (จาก cron, sessions_send, etc.) */
+export function trackPush(userId: string): void {
+  _pushCountByUser.set(userId, (_pushCountByUser.get(userId) || 0) + 1);
+}
+
+/** เช็ค + reset push count สำหรับ user */
+export function consumePushCount(userId: string): number {
+  const count = _pushCountByUser.get(userId) || 0;
+  if (count > 0) _pushCountByUser.delete(userId);
+  return count;
+}
+
 // Validate LINE signature (HMAC-SHA256) — แบบเดียวกับ OpenClaw
 export function validateSignature(body: Buffer, signature: string): boolean {
   const hash = crypto
@@ -216,19 +232,28 @@ export async function handleWebhook(events: WebhookEvent[]): Promise<void> {
     const processed = await processMessage(event);
     if (!processed) continue;
 
+    // เก็บ quoteToken เผื่อต้อง quote reply (ใช้เฉพาะเมื่อมี push มาแทรก)
+    const quoteToken = (event.message as any).quoteToken as string | undefined;
+
     console.log(`[LINE] ${userId}: ${processed.text.substring(0, 100)}`);
 
     try {
+      // Reset push counter ก่อนเริ่มประมวลผล
+      consumePushCount(userId);
+
       // แสดง loading animation ระหว่างรอ AI ตอบ (แสดงนาน 60 วินาที)
       await lineClient.showLoadingAnimation({ chatId: userId, loadingSeconds: 60 }).catch(() => {});
 
       // ส่งข้อความไป AI แล้วรอคำตอบ (do-until loop อยู่ข้างใน)
       const result = await chat(userId, processed.text, processed.media);
 
-      console.log(`[AI] → ${result.text.substring(0, 100)}...`);
+      // เช็คว่ามี push มาแทรกระหว่างรอ AI ตอบมั้ย
+      const hadPushInterrupt = consumePushCount(userId) > 0;
+
+      console.log(`[AI] → ${result.text.substring(0, 100)}...${hadPushInterrupt ? " (quote reply)" : ""}`);
 
       // สร้าง messages สำหรับ reply
-      const messages: Array<{ type: string; text?: string; originalContentUrl?: string; previewImageUrl?: string; duration?: number }> = [];
+      const messages: Array<Record<string, unknown>> = [];
 
       // ถ้ามี image จาก message tool → ส่งเป็น image message
       if (result.imageUrl) {
@@ -251,9 +276,17 @@ export async function handleWebhook(events: WebhookEvent[]): Promise<void> {
       }
 
       // ส่งคำตอบ text กลับ LINE (strip markdown → แบ่งตรงจุดที่เหมาะสม)
+      // ใส่ quoteToken เฉพาะเมื่อมี push มาแทรก เพื่อแยกบริบท (ไม่ quote ปกติ = ไม่รก)
+      const useQuote = hadPushInterrupt && !!quoteToken;
       const chunks = splitReply(stripMarkdown(result.text));
+      let firstText = true;
       for (const text of chunks) {
-        messages.push({ type: "text", text });
+        const msg: Record<string, unknown> = { type: "text", text };
+        if (firstText && useQuote) {
+          msg.quoteToken = quoteToken;
+          firstText = false;
+        }
+        messages.push(msg);
       }
 
       // LINE reply (สูงสุด 5 messages)

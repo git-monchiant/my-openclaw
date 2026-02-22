@@ -18,12 +18,13 @@ import cron from "node-cron";
 import crypto from "crypto";
 import type { ToolDefinition, ToolContext } from "./types.js";
 import { getDb } from "../memory/store.js";
-import { lineClient } from "../line.js";
+import { lineClient, trackPush } from "../line.js";
 
 // Lazy import เพื่อหลีกเลี่ยง circular dependency: cron → ai → tools/index → cron
+// skipHistory = true → ไม่โหลด/บันทึก history ป้องกัน context ปนกับ conversation หลัก
 async function lazyChat(userId: string, message: string) {
   const { chat } = await import("../ai.js");
-  return chat(userId, message);
+  return chat(userId, message, undefined, { skipHistory: true });
 }
 
 // ===== Types =====
@@ -116,11 +117,14 @@ async function executeJob(job: CronJob, dataDir: string): Promise<{ success: boo
       // ผลลัพธ์ส่งกลับ user ผ่าน LINE push
       const result = await lazyChat(job.target_user_id, `[Scheduled Task: ${job.name}]\n${job.message}`);
 
-      // Send AI response text
+      // Send AI response — ขึ้นต้นด้วย header เพื่อแยกบริบทจาก conversation ปกติ
       const messages: Array<Record<string, unknown>> = [];
+      const header = `⏰ งานตามนัด: ${job.name}`;
 
       if (result.text) {
-        messages.push({ type: "text", text: result.text });
+        messages.push({ type: "text", text: `${header}\n\n${result.text}` });
+      } else {
+        messages.push({ type: "text", text: header });
       }
 
       // AI อาจ return image (จาก send_image tool)
@@ -142,6 +146,7 @@ async function executeJob(job: CronJob, dataDir: string): Promise<{ success: boo
       }
 
       if (messages.length > 0) {
+        trackPush(job.target_user_id);
         await lineClient.pushMessage({
           to: job.target_user_id,
           messages: messages as any,
@@ -151,6 +156,7 @@ async function executeJob(job: CronJob, dataDir: string): Promise<{ success: boo
       console.log(`[cron] AI task "${job.name}" completed: ${result.text.substring(0, 100)}...`);
     } else {
       // ===== Text mode: send text message directly (เหมือน OpenClaw systemEvent) =====
+      trackPush(job.target_user_id);
       await lineClient.pushMessage({
         to: job.target_user_id,
         messages: [{ type: "text", text: `⏰ ${job.message}` }],

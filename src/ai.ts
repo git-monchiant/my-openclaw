@@ -24,7 +24,7 @@ const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL?.trim() || "http://localhost
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL?.trim() || "glm-4.7-flash";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim() || "";
-const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || "gemini-2.0-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 
 const anthropicClient = AI_PROVIDER === "anthropic" ? new Anthropic() : null;
@@ -37,10 +37,31 @@ const providerLabel: Record<string, string> = {
 };
 console.log(`[AI] Provider: ${providerLabel[AI_PROVIDER]}`);
 
-const SYSTEM_PROMPT = `You are MyClaw, a helpful AI assistant on LINE.
+function getSystemPrompt(): string {
+  const now = new Date().toLocaleString("en-GB", {
+    timeZone: "Asia/Bangkok",
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  return `You are MyClaw, a helpful AI assistant on LINE.
+Current date/time: ${now} (Asia/Bangkok)
 IMPORTANT: Always reply in the SAME language the user writes in. If the user writes in Thai, reply in Thai only. Never switch to another language.
 Reply concisely. You have access to tools - use them when needed.
-You can receive and understand images, audio messages, videos, stickers, locations, and files that users send.`;
+You can receive and understand images, audio messages, videos, stickers, locations, and files that users send.
+When the user refers to relative dates ("yesterday", "last night", "เมื่อคืน"), always use the current date above to determine the exact date before searching.
+
+Key capabilities:
+- When the user asks you to DO something at a scheduled time (e.g. "send me a cat picture in 5 minutes", "summarize news every morning"), use the cron tool with taskType "ai". This spawns a full AI chat at the scheduled time that can use all tools (web_search, image, message push_image, etc).
+- Only use cron taskType "text" for simple text reminders/alarms.
+- You can search the web (web_search), fetch web pages (web_fetch), analyze images (image), send images (message push_image), generate speech (tts), and control a browser (browser).
+
+Searching:
+Before searching, THINK about what the user actually wants. Consider: the current date/time, what specific content they want, which source they mentioned, and what context is implied. Build a precise search query — vague queries give bad results. If the user mentions a source, include it in the query. If results are wrong, try different keywords — don't just give up or use a different source without telling the user.`;
+}
 
 const MAX_HISTORY = 20;
 
@@ -81,14 +102,21 @@ function checkToolResultForMedia(result: string): void {
 
 /**
  * Core agent loop (do-until) + Memory System
+ * @param options.skipHistory - true = ไม่โหลด/บันทึก history (สำหรับ background tasks เช่น cron AI)
  */
-export async function chat(userId: string, message: string, media?: MediaData): Promise<ChatResult> {
+export interface ChatOptions {
+  skipHistory?: boolean;
+}
+
+export async function chat(userId: string, message: string, media?: MediaData, options?: ChatOptions): Promise<ChatResult> {
   if (AI_PROVIDER === "none") {
     return { text: "ยังไม่ได้ตั้งค่า AI provider กรุณาใส่ GEMINI_API_KEY, OLLAMA_MODEL หรือ ANTHROPIC_API_KEY ใน .env" };
   }
 
-  // 1. โหลด history จาก DB
-  const dbHistory = loadHistory(userId, MAX_HISTORY, memoryConfig);
+  const skip = options?.skipHistory ?? false;
+
+  // 1. โหลด history จาก DB (skip สำหรับ background tasks)
+  const dbHistory = skip ? [] : loadHistory(userId, MAX_HISTORY, memoryConfig);
 
   // 2. ค้นหา memory ที่เกี่ยวข้อง (hybrid search)
   let memoryContext = "";
@@ -104,12 +132,12 @@ export async function chat(userId: string, message: string, media?: MediaData): 
 
   // 3. ประกอบ system prompt + memory context
   const fullSystemPrompt = memoryContext
-    ? `${SYSTEM_PROMPT}\n\n${memoryContext}`
-    : SYSTEM_PROMPT;
+    ? `${getSystemPrompt()}\n\nNote: The memories below are from PAST conversations and may be outdated. Do NOT confuse them with current facts.\n\n${memoryContext}`
+    : getSystemPrompt();
 
   // บันทึกข้อความ user ลง DB + index เข้า memory
   // ถ้ามี media → รอ AI ตอบก่อน แล้วเก็บ enriched message พร้อม description
-  if (!media) {
+  if (!skip && !media) {
     saveMessage(userId, "user", message, memoryConfig).catch(console.error);
   }
 
@@ -140,7 +168,7 @@ export async function chat(userId: string, message: string, media?: MediaData): 
   }
 
   // ถ้ามี media → เก็บ user message พร้อม AI description/transcript (เหมือน OpenClaw)
-  if (media) {
+  if (!skip && media) {
     const isAudioVideo = media.mimeType.startsWith("audio/") || media.mimeType.startsWith("video/");
     const mediaType = media.mimeType.startsWith("image/") ? "Image"
       : media.mimeType.startsWith("video/") ? "Video"
@@ -153,8 +181,10 @@ export async function chat(userId: string, message: string, media?: MediaData): 
     saveMessage(userId, "user", `[${mediaType}: ${desc}]`, memoryConfig).catch(console.error);
   }
 
-  // บันทึกคำตอบ AI ลง DB + index เข้า memory
-  saveMessage(userId, "assistant", reply, memoryConfig).catch(console.error);
+  // บันทึกคำตอบ AI ลง DB + index เข้า memory (skip สำหรับ background tasks)
+  if (!skip) {
+    saveMessage(userId, "assistant", reply, memoryConfig).catch(console.error);
+  }
 
   const result: ChatResult = { text: reply };
   const audio = _lastAudioResult as AudioResult | undefined;
@@ -253,6 +283,7 @@ async function chatGemini(
         "x-goog-api-key": GEMINI_API_KEY,
       },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(60_000), // 60s timeout ป้องกัน hang
     });
 
     if (!res.ok) {
@@ -359,6 +390,7 @@ async function chatOllama(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120_000), // 120s timeout (Ollama local อาจช้า)
     });
 
     if (!res.ok) {

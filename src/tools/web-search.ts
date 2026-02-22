@@ -29,7 +29,7 @@ const DEFAULT_SEARCH_COUNT = 5;
 const MAX_SEARCH_COUNT = 10;
 
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
-const DEFAULT_GEMINI_SEARCH_MODEL = "gemini-2.0-flash";
+const DEFAULT_GEMINI_SEARCH_MODEL = "gemini-2.5-flash";
 
 const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
 const DEFAULT_PERPLEXITY_BASE_URL = "https://openrouter.ai/api/v1";
@@ -203,7 +203,7 @@ async function runGeminiSearch(params: {
     contents: [{ parts: [{ text: params.query }] }],
     tools: [{ google_search: {} }],
     systemInstruction: {
-      parts: [{ text: "Always include relevant source URLs in your response. When the user asks for links, provide the actual URLs from search results." }],
+      parts: [{ text: "Always include relevant source URLs in your response. When the user asks for links, provide the actual URLs from search results. When searching for video clips, highlights, or any video content, ALWAYS include YouTube video URLs (https://www.youtube.com/watch?v=...) in your response. Prioritize youtube.com results for video-related queries." }],
     },
   };
 
@@ -226,6 +226,10 @@ async function runGeminiSearch(params: {
   const candidate = data.candidates?.[0];
   const textParts = candidate?.content?.parts?.filter((p) => p.text).map((p) => p.text!) ?? [];
   let content = textParts.join("\n") || "No response";
+
+  // Strip URLs from Gemini text — they are often hallucinated.
+  // Real URLs come from groundingChunks below.
+  content = content.replace(/https?:\/\/[^\s)>\]]+/g, "").replace(/\n{3,}/g, "\n\n").trim();
 
   // Extract citations from groundingChunks
   const chunks = candidate?.groundingMetadata?.groundingChunks ?? [];
@@ -255,13 +259,13 @@ async function runGeminiSearch(params: {
 
   const citations = [...new Set(resolvedUris)];
 
-  // Append citations to content so the AI model sees them clearly
+  // Append ONLY grounding chunk URLs (these are real, verified URLs from Google Search)
   if (citations.length > 0) {
     const citationLines = citations.map((uri, i) => {
       const title = chunks[i]?.web?.title || "";
       return title ? `[${i + 1}] ${title}: ${uri}` : `[${i + 1}] ${uri}`;
     });
-    content += "\n\nSources:\n" + citationLines.join("\n");
+    content += "\n\nSources (verified URLs):\n" + citationLines.join("\n");
   }
 
   return { content, citations };
