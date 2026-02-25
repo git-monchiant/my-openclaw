@@ -34,11 +34,16 @@ export async function hybridSearch(
   const keywords = extractKeywords(query);
   const ftsQuery = buildFtsQuery(keywords);
 
+  const KB_SESSION = "__kb__";
+
   // ===== ทาง A: Vector Search =====
   if (isEmbeddingAvailable()) {
     try {
       const queryEmbedding = await embedText(query, dataDir);
-      const chunks = getChunksWithEmbeddings(dataDir, userId);
+      // Include user chunks + KB chunks (KB always included)
+      const userChunks = getChunksWithEmbeddings(dataDir, userId);
+      const kbChunks = userId !== KB_SESSION ? getChunksWithEmbeddings(dataDir, KB_SESSION) : [];
+      const chunks = [...userChunks, ...kbChunks];
 
       for (const chunk of chunks) {
         const similarity = cosineSimilarity(queryEmbedding, chunk.embedding);
@@ -64,7 +69,9 @@ export async function hybridSearch(
     const fallbackFts = buildFtsQuery(fallbackKeywords.length > 0 ? fallbackKeywords : [query]);
     if (fallbackFts) {
       const candidateCount = Math.max(maxResults * 4, 24);
-      const keywordResults = keywordSearch(dataDir, fallbackFts, candidateCount, userId);
+      const userKw = keywordSearch(dataDir, fallbackFts, candidateCount, userId);
+      const kbKw = userId !== KB_SESSION ? keywordSearch(dataDir, fallbackFts, candidateCount, KB_SESSION) : [];
+      const keywordResults = dedupeSearchResults([...userKw, ...kbKw]);
       for (const result of keywordResults) {
         scoreMap.set(result.id, {
           vectorScore: 0,
@@ -87,7 +94,9 @@ export async function hybridSearch(
 
   if (ftsQuery) {
     const candidateCount = Math.max(maxResults * 4, 24);
-    const keywordResults = keywordSearch(dataDir, ftsQuery, candidateCount, userId);
+    const userKwMain = keywordSearch(dataDir, ftsQuery, candidateCount, userId);
+    const kbKwMain = userId !== KB_SESSION ? keywordSearch(dataDir, ftsQuery, candidateCount, KB_SESSION) : [];
+    const keywordResults = dedupeSearchResults([...userKwMain, ...kbKwMain]);
 
     for (const result of keywordResults) {
       const existing = scoreMap.get(result.id);
@@ -145,9 +154,12 @@ export async function hybridSearch(
     }
   }
 
-  // ===== Temporal Decay (เหมือน OpenClaw) =====
+  // ===== Temporal Decay (เหมือน OpenClaw) — skip for KB chunks =====
   if (config.temporalDecay.enabled) {
-    merged = applyTemporalDecay(merged, config.temporalDecay.halfLifeDays);
+    const kbItems = merged.filter((r) => r.chunk.source === "knowledge");
+    const chatItems = merged.filter((r) => r.chunk.source !== "knowledge");
+    const decayed = applyTemporalDecay(chatItems, config.temporalDecay.halfLifeDays);
+    merged = [...kbItems, ...decayed];
   }
 
   // Sort by score descending
@@ -180,4 +192,18 @@ export async function hybridSearch(
   }
 
   return merged.slice(0, maxResults).map(({ createdAt: _, ...r }) => r);
+}
+
+/** Deduplicate keyword results by id (keep highest score) */
+function dedupeSearchResults(
+  results: Array<{ id: string; text: string; score: number; createdAt: number }>,
+): Array<{ id: string; text: string; score: number; createdAt: number }> {
+  const map = new Map<string, { id: string; text: string; score: number; createdAt: number }>();
+  for (const r of results) {
+    const existing = map.get(r.id);
+    if (!existing || r.score > existing.score) {
+      map.set(r.id, r);
+    }
+  }
+  return [...map.values()];
 }

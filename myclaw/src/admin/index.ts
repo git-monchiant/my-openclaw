@@ -6,18 +6,26 @@
 import { Router } from "express";
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
+import fs from "node:fs";
+import path from "node:path";
+import { execSync } from "node:child_process";
 import { getDb } from "../memory/store.js";
-import { getMemoryStatus } from "../memory/manager.js";
+import { getMemoryStatus, indexKnowledgeDoc, deleteKnowledgeDocChunks } from "../memory/manager.js";
+import { listKnowledgeDocs, getKnowledgeDoc, insertKnowledgeDoc, updateKnowledgeDoc, deleteKnowledgeDoc, countChunksBySession } from "../memory/store.js";
 import { getToolDefinitions } from "../tools/index.js";
 import { getRunningTasks, getTasksFromDb } from "../tools/sessions-spawn.js";
 import { logBuffer, configOverrides } from "../tools/gateway.js";
 import { cronTool } from "../tools/cron.js";
 import { getDashboardHtml, getLoginHtml } from "./html.js";
-import { getGeminiUsage, getLinePushUsage } from "./usage-tracker.js";
+import { getGeminiUsage, getLinePushUsage, getWebhookStats, getAgentUsage, getAllAgentsUsage, initUsageTracker, getUsageHistory } from "./usage-tracker.js";
+import { sseHandler, getSSEClientCount } from "./events.js";
+import { getActiveTasks, getTraces, getTrace } from "./active-tasks.js";
+import { getQueueStats } from "../line.js";
+import { getAllLinkedUsers } from "../google/store.js";
 import { getProviderInfo } from "../ai.js";
 import {
   listAgentsWithSkills, getAgent, createAgent, updateAgent, deleteAgent,
-  setDefaultAgent, listSkills, assignSkill, removeSkill,
+  setDefaultAgent, listSkills, assignSkill, removeSkill, getAgentLogs,
 } from "../agents/registry.js";
 
 const router = Router();
@@ -53,6 +61,12 @@ function adminAuth(req: Request, res: Response, next: NextFunction): void {
 }
 
 router.use(adminAuth);
+
+// ===== SSE real-time events =====
+router.get("/api/events", sseHandler);
+
+// ===== Init persistent usage tracking =====
+initUsageTracker(getDataDir());
 
 // ===== Helper =====
 function getDataDir(): string {
@@ -123,6 +137,7 @@ router.get("/api/status", (_req, res) => {
     available: providerInfo.available,
     db: dbStats,
     startedAt,
+    sseClients: getSSEClientCount(),
   });
 });
 
@@ -200,6 +215,96 @@ router.get("/api/memory", (_req, res) => {
   }
 });
 
+// ===== Knowledge Base CRUD =====
+router.get("/api/knowledge", (_req, res) => {
+  try {
+    const dataDir = getDataDir();
+    const docs = listKnowledgeDocs(dataDir);
+    const kbChunks = countChunksBySession(dataDir, "__kb__");
+    res.json({ total: docs.length, kbChunks, docs });
+  } catch (err: any) {
+    res.json({ total: 0, kbChunks: 0, docs: [], error: err?.message });
+  }
+});
+
+router.get("/api/knowledge/:id", (req, res) => {
+  try {
+    const doc = getKnowledgeDoc(getDataDir(), req.params.id);
+    if (!doc) { res.status(404).json({ error: "not_found" }); return; }
+    res.json(doc);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message });
+  }
+});
+
+router.post("/api/knowledge", async (req, res) => {
+  try {
+    const { id, title, content, category } = req.body;
+    if (!id || !title || !content) {
+      res.status(400).json({ error: "missing_fields", message: "id, title, content are required" });
+      return;
+    }
+    // Sanitize id
+    const safeId = String(id).replace(/[^a-zA-Z0-9_-]/g, "").substring(0, 64);
+    if (!safeId) { res.status(400).json({ error: "invalid_id" }); return; }
+
+    insertKnowledgeDoc(getDataDir(), { id: safeId, title, content, category });
+    // Index into memory
+    const chunkCount = await indexKnowledgeDoc(safeId, content);
+    res.json({ success: true, id: safeId, chunkCount });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message });
+  }
+});
+
+router.put("/api/knowledge/:id", async (req, res) => {
+  try {
+    const dataDir = getDataDir();
+    const existing = getKnowledgeDoc(dataDir, req.params.id);
+    if (!existing) { res.status(404).json({ error: "not_found" }); return; }
+
+    const { title, content, category } = req.body;
+    updateKnowledgeDoc(dataDir, req.params.id, { title, content, category });
+
+    // Re-index if content changed
+    let chunkCount = existing.chunk_count;
+    if (content !== undefined && content !== existing.content) {
+      chunkCount = await indexKnowledgeDoc(req.params.id, content);
+    }
+
+    res.json({ success: true, id: req.params.id, chunkCount });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message });
+  }
+});
+
+router.delete("/api/knowledge/:id", (req, res) => {
+  try {
+    const dataDir = getDataDir();
+    const existing = getKnowledgeDoc(dataDir, req.params.id);
+    if (!existing) { res.status(404).json({ error: "not_found" }); return; }
+
+    deleteKnowledgeDocChunks(req.params.id);
+    deleteKnowledgeDoc(dataDir, req.params.id);
+    res.json({ success: true, id: req.params.id });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message });
+  }
+});
+
+router.post("/api/knowledge/:id/reindex", async (req, res) => {
+  try {
+    const dataDir = getDataDir();
+    const doc = getKnowledgeDoc(dataDir, req.params.id);
+    if (!doc) { res.status(404).json({ error: "not_found" }); return; }
+
+    const chunkCount = await indexKnowledgeDoc(req.params.id, doc.content);
+    res.json({ success: true, id: req.params.id, chunkCount });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message });
+  }
+});
+
 // ===== GET /api/config =====
 router.get("/api/config", (_req, res) => {
   const SENSITIVE = new Set([
@@ -209,7 +314,7 @@ router.get("/api/config", (_req, res) => {
   ]);
 
   const envKeys = [
-    "GEMINI_MODEL", "OLLAMA_MODEL", "OLLAMA_BASE_URL", "OLLAMA_EMBED_MODEL",
+    "GEMINI_MODEL", "OLLAMA_MODEL", "OLLAMA_BASE_URL",
     "DATA_DIR", "PORT", "WEB_SEARCH_PROVIDER", "GEMINI_TTS_MODEL",
     "OWNER_USER_ID", "BASE_URL",
   ];
@@ -233,6 +338,26 @@ router.get("/api/config", (_req, res) => {
   }
 
   res.json({ config, overrideCount: configOverrides.size });
+});
+
+// ===== GET /api/deps =====
+function checkDep(name: string, versionFlag: string, installCmd: string) {
+  try {
+    const ver = execSync(`${name} ${versionFlag} 2>&1`, { timeout: 5000, stdio: "pipe" }).toString().trim().split("\n")[0];
+    return { name, installed: true, version: ver, installCmd };
+  } catch {
+    return { name, installed: false, version: null, installCmd };
+  }
+}
+
+router.get("/api/deps", (_req, res) => {
+  const isMac = process.platform === "darwin";
+  res.json({
+    deps: [
+      checkDep("ffmpeg", "-version", isMac ? "brew install ffmpeg" : "apt install -y ffmpeg"),
+      checkDep("chromium", "--version", "npx playwright install chromium"),
+    ],
+  });
 });
 
 // ===== GET /api/tools =====
@@ -359,11 +484,55 @@ router.get("/api/line-push", (_req, res) => {
   res.json(getLinePushUsage());
 });
 
+// ===== GET /api/usage/history =====
+router.get("/api/usage/history", (req, res) => {
+  const days = Math.min(90, Math.max(1, Number(req.query.days) || 30));
+  const metric = (req.query.metric as string) || "api_calls";
+  res.json({ days, metric, data: getUsageHistory(days, metric) });
+});
+
+// ===== GET /api/queue =====
+router.get("/api/queue", (_req, res) => {
+  res.json(getQueueStats());
+});
+
+// ===== GET /api/active-tasks =====
+router.get("/api/active-tasks", (_req, res) => {
+  res.json(getActiveTasks());
+});
+
+// ===== Execution Traces =====
+router.get("/api/traces", (req, res) => {
+  const limit = parseInt(req.query.limit as string) || 50;
+  res.json(getTraces(limit));
+});
+
+router.get("/api/traces/:id", (req, res) => {
+  const trace = getTrace(req.params.id);
+  if (!trace) return res.status(404).json({ error: "trace not found" });
+  res.json(trace);
+});
+
+// ===== GET /api/traffic =====
+router.get("/api/traffic", (_req, res) => {
+  res.json(getWebhookStats());
+});
+
+// ===== GET /api/google-users =====
+router.get("/api/google-users", (_req, res) => {
+  try {
+    const users = getAllLinkedUsers(getDataDir());
+    res.json({ total: users.length, users });
+  } catch (err: any) {
+    res.json({ total: 0, users: [], error: err?.message });
+  }
+});
+
 // ===== POST /api/provider =====
 router.post("/api/provider", (req, res) => {
   const { provider } = req.body || {};
-  if (!provider || !["gemini", "ollama", "anthropic", "auto"].includes(provider)) {
-    res.status(400).json({ error: "invalid_provider", message: "Provider must be: gemini, ollama, anthropic, or auto" });
+  if (!provider || !["gemini", "openrouter", "ollama", "anthropic", "auto"].includes(provider)) {
+    res.status(400).json({ error: "invalid_provider", message: "Provider must be: gemini, openrouter, ollama, anthropic, or auto" });
     return;
   }
 
@@ -400,13 +569,13 @@ router.get("/api/agents", (_req, res) => {
 
 // ===== POST /api/agents =====
 router.post("/api/agents", (req, res) => {
-  const { id, name, description, provider, model, systemPrompt } = req.body || {};
+  const { id, name, description, provider, model, apiKey, systemPrompt } = req.body || {};
   if (!id || !name || !provider || !model) {
     res.status(400).json({ error: "missing_fields", message: "id, name, provider, model are required" });
     return;
   }
   try {
-    const agent = createAgent(getDataDir(), { id, name, description, provider, model, systemPrompt });
+    const agent = createAgent(getDataDir(), { id, name, description, provider, model, apiKey, systemPrompt });
     res.json({ success: true, agent });
   } catch (err: any) {
     res.status(400).json({ error: err?.message });
@@ -415,8 +584,8 @@ router.post("/api/agents", (req, res) => {
 
 // ===== PUT /api/agents/:id =====
 router.put("/api/agents/:id", (req, res) => {
-  const { name, description, provider, model, systemPrompt, enabled } = req.body || {};
-  const result = updateAgent(getDataDir(), req.params.id, { name, description, provider, model, systemPrompt, enabled });
+  const { name, description, provider, model, apiKey, systemPrompt, enabled } = req.body || {};
+  const result = updateAgent(getDataDir(), req.params.id, { name, description, provider, model, apiKey, systemPrompt, enabled });
   if (!result) {
     res.status(404).json({ error: "not_found" });
     return;
@@ -478,5 +647,131 @@ router.delete("/api/agents/:id/skills/:skillId", (req, res) => {
     res.status(400).json({ error: err?.message });
   }
 });
+
+// ===== GET /api/agents/:id/logs =====
+router.get("/api/agents/:id/logs", (req, res) => {
+  const agentId = req.params.id;
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+
+  try {
+    const result = getAgentLogs(getDataDir(), agentId, limit, offset);
+    res.json(result);
+  } catch (err: any) {
+    res.json({ logs: [], total: 0, error: err?.message });
+  }
+});
+
+// ===== GET /api/agents/:id/usage =====
+router.get("/api/agents/:id/usage", (req, res) => {
+  const agentId = req.params.id;
+  try {
+    res.json(getAgentUsage(agentId));
+  } catch (err: any) {
+    res.json({ error: err?.message });
+  }
+});
+
+// ===== GET /api/agents-usage =====
+router.get("/api/agents-usage", (_req, res) => {
+  try {
+    res.json(getAllAgentsUsage());
+  } catch (err: any) {
+    res.json({ error: err?.message });
+  }
+});
+
+// ===== GET /api/apps =====
+router.get("/api/apps", (_req, res) => {
+  const dataDir = getDataDir();
+  const appsDir = path.resolve(dataDir, "apps");
+  try {
+    ensureAppsTableSafe(dataDir);
+    const db = getDb(dataDir);
+    const rows = db.prepare("SELECT * FROM apps ORDER BY pinned DESC, created_at DESC").all() as Array<Record<string, any>>;
+
+    const apps = rows.map(row => {
+      const filePath = path.join(appsDir, `${row.id}.html`);
+      const exists = fs.existsSync(filePath);
+      let sizeHuman = formatBytes(row.size || 0);
+      if (exists) {
+        try { sizeHuman = formatBytes(fs.statSync(filePath).size); } catch { /* use DB size */ }
+      }
+      return {
+        id: row.id,
+        title: row.title,
+        language: row.language,
+        category: row.category || "other",
+        size: row.size,
+        sizeHuman,
+        pinned: !!row.pinned,
+        userId: row.user_id,
+        createdAt: row.created_at,
+        url: `/app/${row.id}.html`,
+        fileExists: exists,
+      };
+    });
+
+    res.json({ total: apps.length, apps });
+  } catch (err: any) {
+    res.json({ total: 0, apps: [], error: err?.message });
+  }
+});
+
+// ===== POST /api/apps/:id/pin =====
+router.post("/api/apps/:id/pin", (req, res) => {
+  const dataDir = getDataDir();
+  const id = req.params.id.replace(/[^a-zA-Z0-9_-]/g, "");
+  try {
+    ensureAppsTableSafe(dataDir);
+    const db = getDb(dataDir);
+    const app = db.prepare("SELECT * FROM apps WHERE id = ?").get(id) as any;
+    if (!app) {
+      res.status(404).json({ error: "App not found" });
+      return;
+    }
+    const newPinned = app.pinned ? 0 : 1;
+    db.prepare("UPDATE apps SET pinned = ? WHERE id = ?").run(newPinned, id);
+    res.json({ success: true, id, pinned: !!newPinned });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message });
+  }
+});
+
+// ===== DELETE /api/apps/:id =====
+router.delete("/api/apps/:id", (req, res) => {
+  const dataDir = getDataDir();
+  const appsDir = path.resolve(dataDir, "apps");
+  const id = req.params.id.replace(/[^a-zA-Z0-9_-]/g, "");
+  const filePath = path.join(appsDir, `${id}.html`);
+
+  try {
+    // Delete file
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    // Delete from DB
+    ensureAppsTableSafe(dataDir);
+    getDb(dataDir).prepare("DELETE FROM apps WHERE id = ?").run(id);
+    res.json({ success: true, id });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message });
+  }
+});
+
+// Helper: ensure apps table without importing webapp (avoid circular)
+function ensureAppsTableSafe(dataDir: string): void {
+  const db = getDb(dataDir);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS apps (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      language TEXT NOT NULL DEFAULT 'html',
+      category TEXT NOT NULL DEFAULT 'other',
+      size INTEGER DEFAULT 0,
+      pinned INTEGER DEFAULT 0,
+      user_id TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+}
 
 export { router as adminRouter };

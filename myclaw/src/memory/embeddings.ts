@@ -1,8 +1,5 @@
 /**
- * Embedding Provider — Multi-provider (เหมือน OpenClaw)
- * ลำดับ: OLLAMA_EMBED_MODEL (ฟรี) → GEMINI_API_KEY → keyword-only
- *
- * Provider pattern: แต่ละ provider implement embedQuery + embedBatch
+ * Embedding Provider — Gemini only
  */
 
 import crypto from "node:crypto";
@@ -10,8 +7,6 @@ import { getCachedEmbedding, setCachedEmbedding, pruneEmbeddingCache } from "./s
 import type { EmbeddingProvider } from "./types.js";
 import { trackGemini } from "../admin/usage-tracker.js";
 
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL?.trim() || "http://localhost:11434";
-const OLLAMA_EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL?.trim() || "";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim() || "";
 const GEMINI_EMBED_MODEL = "gemini-embedding-001";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
@@ -84,38 +79,6 @@ function createGeminiProvider(): EmbeddingProvider {
   };
 }
 
-function createOllamaProvider(): EmbeddingProvider {
-  return {
-    id: "ollama",
-    model: OLLAMA_EMBED_MODEL,
-
-    async embedQuery(text: string): Promise<number[]> {
-      const res = await fetch(`${OLLAMA_BASE_URL}/api/embed`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: OLLAMA_EMBED_MODEL, input: text }),
-      });
-
-      if (!res.ok) {
-        const err = await res.text();
-        throw new Error(`Ollama embedding error: ${res.status} ${err}`);
-      }
-
-      const json = (await res.json()) as { embeddings: number[][] };
-      return normalizeVector(json.embeddings[0]);
-    },
-
-    async embedBatch(texts: string[]): Promise<number[][]> {
-      // Ollama ไม่มี batch API → ทำทีละอัน
-      const results: number[][] = [];
-      for (const text of texts) {
-        results.push(await this.embedQuery(text));
-      }
-      return results;
-    },
-  };
-}
-
 // ===== Provider resolution =====
 
 let activeProvider: EmbeddingProvider | null = null;
@@ -125,16 +88,12 @@ function resolveProvider(): EmbeddingProvider | null {
   if (resolved) return activeProvider;
   resolved = true;
 
-  // ลำดับ: Ollama (ฟรี) → Gemini → none
-  if (OLLAMA_EMBED_MODEL) {
-    activeProvider = createOllamaProvider();
-    console.log(`[memory] Embedding: Ollama (${OLLAMA_EMBED_MODEL})`);
-  } else if (GEMINI_API_KEY) {
+  if (GEMINI_API_KEY) {
     activeProvider = createGeminiProvider();
     console.log(`[memory] Embedding: Gemini (${GEMINI_EMBED_MODEL})`);
   } else {
     activeProvider = null;
-    console.log("[memory] No embedding provider — using keyword search only");
+    console.log("[memory] No embedding provider — set GEMINI_API_KEY to enable vector search");
   }
 
   return activeProvider;

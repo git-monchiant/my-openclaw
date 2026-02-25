@@ -23,9 +23,10 @@ import { trackLinePush } from "../admin/usage-tracker.js";
 
 // Lazy import เพื่อหลีกเลี่ยง circular dependency: cron → ai → tools/index → cron
 // skipHistory = true → ไม่โหลด/บันทึก history ป้องกัน context ปนกับ conversation หลัก
+// useOrchestrator = true → ใช้ orchestrator mode เพื่อ delegate ไปหา agent ที่ถูกต้อง
 async function lazyChat(userId: string, message: string) {
   const { chat } = await import("../ai.js");
-  return chat(userId, message, undefined, { skipHistory: true });
+  return chat(userId, message, undefined, { skipHistory: true, useOrchestrator: true });
 }
 
 // ===== Types =====

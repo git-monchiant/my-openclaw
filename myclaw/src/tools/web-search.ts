@@ -204,7 +204,9 @@ async function runGeminiSearch(params: {
     contents: [{ parts: [{ text: params.query }] }],
     tools: [{ google_search: {} }],
     systemInstruction: {
-      parts: [{ text: "Always include relevant source URLs in your response. When the user asks for links, provide the actual URLs from search results. When searching for video clips, highlights, or any video content, ALWAYS include YouTube video URLs (https://www.youtube.com/watch?v=...) in your response. Prioritize youtube.com results for video-related queries." }],
+      parts: [{
+        text: `Today's date: ${new Date().toLocaleDateString("en-GB", { timeZone: "Asia/Bangkok", weekday: "long", year: "numeric", month: "long", day: "numeric" })}. Year: ${new Date().getFullYear()} CE (พ.ศ. ${new Date().getFullYear() + 543}). Always use this date as reference. When searching for international topics (sports scores, world news, technology, etc.), search in ENGLISH for better results, then respond in the user's language. Always include relevant source URLs in your response. When the user asks for links, provide the actual URLs from search results. When searching for video clips, highlights, or any video content, ALWAYS include YouTube video URLs (https://www.youtube.com/watch?v=...) in your response. Prioritize youtube.com results for video-related queries.`,
+      }],
     },
   };
 

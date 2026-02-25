@@ -85,6 +85,19 @@ export function getDb(dataDir: string): Database.Database {
       ON sessions(session_id);
   `);
 
+  // Knowledge Base documents
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS knowledge_docs (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      category TEXT DEFAULT 'general',
+      chunk_count INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+
   // ===== Migration: เพิ่ม source column (safe กับ DB เก่า) =====
   ensureColumn(db, "chunks", "source", "TEXT DEFAULT 'user'");
 
@@ -179,7 +192,7 @@ export function getChunksWithEmbeddings(
     text: row.text,
     hash: row.hash,
     embedding: JSON.parse(row.embedding),
-    source: (row.source || "user") as "user" | "assistant",
+    source: (row.source || "user") as "user" | "assistant" | "knowledge",
     createdAt: row.created_at,
   }));
 }
@@ -323,6 +336,81 @@ export function getMemoryStats(dataDir: string): { chunkCount: number; cacheCoun
   const chunks = (db.prepare("SELECT COUNT(*) as cnt FROM chunks").get() as { cnt: number }).cnt;
   const cache = (db.prepare("SELECT COUNT(*) as cnt FROM embedding_cache").get() as { cnt: number }).cnt;
   return { chunkCount: chunks, cacheCount: cache };
+}
+
+// ===== Knowledge Base =====
+
+export interface KnowledgeDoc {
+  id: string;
+  title: string;
+  content: string;
+  category: string;
+  chunk_count: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export function insertKnowledgeDoc(
+  dataDir: string,
+  doc: { id: string; title: string; content: string; category?: string },
+): void {
+  const db = getDb(dataDir);
+  const now = Date.now();
+  db.prepare(
+    `INSERT OR REPLACE INTO knowledge_docs (id, title, content, category, chunk_count, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 0, COALESCE((SELECT created_at FROM knowledge_docs WHERE id = ?), ?), ?)`,
+  ).run(doc.id, doc.title, doc.content, doc.category || "general", doc.id, now, now);
+}
+
+export function updateKnowledgeDoc(
+  dataDir: string,
+  id: string,
+  updates: { title?: string; content?: string; category?: string },
+): void {
+  const db = getDb(dataDir);
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  if (updates.title !== undefined) { sets.push("title = ?"); vals.push(updates.title); }
+  if (updates.content !== undefined) { sets.push("content = ?"); vals.push(updates.content); }
+  if (updates.category !== undefined) { sets.push("category = ?"); vals.push(updates.category); }
+  if (sets.length === 0) return;
+  sets.push("updated_at = ?");
+  vals.push(Date.now());
+  vals.push(id);
+  db.prepare(`UPDATE knowledge_docs SET ${sets.join(", ")} WHERE id = ?`).run(...vals);
+}
+
+export function updateKnowledgeDocChunkCount(dataDir: string, id: string, count: number): void {
+  const db = getDb(dataDir);
+  db.prepare("UPDATE knowledge_docs SET chunk_count = ?, updated_at = ? WHERE id = ?").run(count, Date.now(), id);
+}
+
+export function getKnowledgeDoc(dataDir: string, id: string): KnowledgeDoc | undefined {
+  const db = getDb(dataDir);
+  return db.prepare("SELECT * FROM knowledge_docs WHERE id = ?").get(id) as KnowledgeDoc | undefined;
+}
+
+export function listKnowledgeDocs(dataDir: string): KnowledgeDoc[] {
+  const db = getDb(dataDir);
+  return db.prepare("SELECT * FROM knowledge_docs ORDER BY updated_at DESC").all() as KnowledgeDoc[];
+}
+
+export function deleteKnowledgeDoc(dataDir: string, id: string): void {
+  const db = getDb(dataDir);
+  db.prepare("DELETE FROM knowledge_docs WHERE id = ?").run(id);
+}
+
+/** Delete all chunks whose id starts with a given prefix (used for KB re-indexing) */
+export function deleteChunksByIdPrefix(dataDir: string, prefix: string): number {
+  const db = getDb(dataDir);
+  const result = db.prepare("DELETE FROM chunks WHERE id LIKE ? || '%'").run(prefix);
+  return result.changes;
+}
+
+/** Count chunks for a given session_id */
+export function countChunksBySession(dataDir: string, sessionId: string): number {
+  const db = getDb(dataDir);
+  return (db.prepare("SELECT COUNT(*) as cnt FROM chunks WHERE session_id = ?").get(sessionId) as { cnt: number }).cnt;
 }
 
 // Close DB

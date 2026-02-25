@@ -9,6 +9,7 @@ export interface AgentConfig {
   description: string;
   provider: string;       // gemini, anthropic, openai, ollama
   model: string;          // gemini-2.5-flash, claude-sonnet-4, gpt-4o, glm-4.7-flash
+  apiKey: string | null;  // per-agent API key (null = ใช้จาก env)
   systemPrompt: string | null; // null = ใช้ default prompt
   enabled: boolean;
   isDefault: boolean;

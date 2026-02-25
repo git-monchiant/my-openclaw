@@ -19,6 +19,16 @@ import { canvasTool } from "./canvas.js";
 import { browserTool } from "./browser.js";
 import { nodesTool } from "./nodes.js";
 import { sessionsSendTool } from "./sessions-send.js";
+import { delegateTaskTool } from "./delegate-task.js";
+import { customApiTool } from "./custom-api.js";
+import { gmailTool } from "./gmail.js";
+import { calendarTool } from "./calendar.js";
+import { driveTool } from "./drive.js";
+import { sheetsTool } from "./sheets.js";
+import { googleLinkTool } from "./google-link.js";
+import { placesTool } from "./places.js";
+import { webappTool } from "./webapp.js";
+import { userProfileTool } from "./user-profile.js";
 
 /**
  * Tool Registry
@@ -49,6 +59,16 @@ const allTools: ToolDefinition[] = [
   browserTool,
   nodesTool,
   sessionsSendTool,
+  delegateTaskTool,
+  customApiTool,
+  gmailTool,
+  calendarTool,
+  driveTool,
+  sheetsTool,
+  googleLinkTool,
+  placesTool,
+  webappTool,
+  userProfileTool,
 ];
 
 // Initialize cron jobs from DB on startup

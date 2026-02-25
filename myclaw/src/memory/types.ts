@@ -10,7 +10,7 @@ export interface MemoryChunk {
   text: string;
   embedding: number[] | null;
   hash: string; // SHA256(text) — for deduplication
-  source: "user" | "assistant"; // ใครพูด
+  source: "user" | "assistant" | "knowledge"; // ใครพูด / knowledge = KB doc
   createdAt: number;
 }
 

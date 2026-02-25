@@ -15,7 +15,9 @@ import type { messagingApi } from "@line/bot-sdk";
 // Context ที่ส่งให้ tool ทุกตัวเมื่อถูกเรียก
 export interface ToolContext {
   userId: string;
+  agentId?: string; // ID ของ agent ที่กำลังทำงาน (สำหรับ activity logging)
   lineClient?: messagingApi.MessagingApiClient;
+  media?: { buffer: Buffer; mimeType: string; size: number }; // สำหรับ delegate_task forward media ให้ agent
 }
 
 // Tool definition ที่ทุก tool ต้อง implement

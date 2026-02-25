@@ -27,3 +27,16 @@
 - เพิ่ม better-sqlite3 dependency
 - เพิ่ม OPENAI_API_KEY ใน .env.example
 - TypeScript compile ผ่าน
+
+## 2026-02-21 ~ 2026-02-23 (Sessions ต่อมา)
+- ใส่ credentials จริงใน .env (LINE, Gemini, Anthropic)
+- เพิ่ม multi-provider support: Gemini (default) + Ollama + Anthropic + auto-fallback
+- เพิ่ม tool: web_search (รองรับ Gemini, Brave, Perplexity, Grok)
+- เพิ่ม tool: web-fetch / http_request (GET/POST/PUT/DELETE/PATCH/HEAD)
+- รองรับรูปภาพ/วิดีโอ/เสียงจาก LINE (multimodal)
+- สร้าง admin dashboard ครบ (UI + REST API ที่ /admin)
+- เพิ่ม agent system พร้อม skill-based tool filtering
+- เพิ่ม usage tracker (Gemini, LINE)
+- เพิ่ม cron system รองรับ AI task mode
+- แก้ปัญหา AI สับสนวันที่, search quality, cron history pollution, push interrupt handling
+- Port 20 tools จาก OpenClaw มาพร้อม feature parity

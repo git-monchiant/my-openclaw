@@ -22,17 +22,32 @@ export async function downloadLineMedia(
   mimeTypeHint?: string,
 ): Promise<MediaData> {
   const client = new messagingApi.MessagingApiBlobClient({ channelAccessToken });
-  const response = await client.getMessageContent(messageId);
+
+  let response: AsyncIterable<Buffer>;
+  try {
+    response = await client.getMessageContent(messageId) as AsyncIterable<Buffer>;
+  } catch (err: any) {
+    throw new Error(`Failed to start media download: ${err?.message || err}`);
+  }
 
   const chunks: Buffer[] = [];
   let totalSize = 0;
 
-  for await (const chunk of response as AsyncIterable<Buffer>) {
-    totalSize += chunk.length;
-    if (totalSize > maxBytes) {
-      throw new Error(`Media exceeds ${Math.round(maxBytes / (1024 * 1024))}MB limit`);
+  try {
+    for await (const chunk of response) {
+      totalSize += chunk.length;
+      if (totalSize > maxBytes) {
+        // Try to destroy the stream to free resources
+        if (typeof (response as any).destroy === "function") (response as any).destroy();
+        throw new Error(`Media exceeds ${Math.round(maxBytes / (1024 * 1024))}MB limit`);
+      }
+      chunks.push(chunk);
     }
-    chunks.push(chunk);
+  } catch (err: any) {
+    // Re-throw size limit errors as-is
+    if (err?.message?.includes("MB limit")) throw err;
+    // Wrap stream/socket errors with context
+    throw new Error(`Media download interrupted after ${Math.round(totalSize / 1024)}KB: ${err?.message || err}`);
   }
 
   const buffer = Buffer.concat(chunks);

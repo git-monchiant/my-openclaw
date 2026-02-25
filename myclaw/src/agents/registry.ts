@@ -44,13 +44,72 @@ function ensureAgentsTables(dataDir: string): void {
       priority INTEGER DEFAULT 0,
       PRIMARY KEY (agent_id, skill_id)
     );
+
+    CREATE TABLE IF NOT EXISTS agent_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      user_id TEXT,
+      task TEXT,
+      detail TEXT,
+      status TEXT DEFAULT 'ok',
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_logs_agent ON agent_logs(agent_id, created_at DESC);
   `);
+
+  // Migration: add api_key column if it doesn't exist
+  try { db.exec("ALTER TABLE agents ADD COLUMN api_key TEXT"); } catch { /* already exists */ }
 
   // Seed if empty
   const agentCount = (db.prepare("SELECT COUNT(*) as cnt FROM agents").get() as any)?.cnt || 0;
   if (agentCount === 0) seedDefaults(db);
 
+  // Migrate: add missing skills (e.g. Google skills added after initial seed)
+  ensureMissingSkills(db);
+
   tablesReady = true;
+}
+
+// ===== Migration: insert skills that were added after initial seed =====
+function ensureMissingSkills(db: ReturnType<typeof getDb>): void {
+  const expectedSkills: Array<[string, string, string, string | null, string[], string, string[]]> = [
+    ["email", "Email", "Read, send, and manage Gmail", null, ["gmail", "google_link"], "non-ai", ["อีเมล", "email", "inbox", "ส่งเมล", "gmail", "mail"]],
+    ["calendar_mgmt", "Calendar", "Manage Google Calendar events", null, ["calendar", "google_link"], "non-ai", ["ปฏิทิน", "calendar", "นัด", "event", "meeting", "นัดหมาย"]],
+    ["cloud_storage", "Cloud Storage", "Manage files in Google Drive", null, ["drive", "google_link"], "non-ai", ["ไดรฟ์", "drive", "ไฟล์", "upload", "อัพโหลด", "file"]],
+    ["spreadsheet", "Spreadsheet", "Read and write Google Sheets", null, ["sheets", "google_link"], "non-ai", ["ชีท", "sheets", "excel", "ตาราง", "spreadsheet", "ข้อมูล"]],
+    ["api_integration", "API Integration", "Call external REST APIs", null, ["custom_api"], "non-ai", ["api", "เรียก", "fetch", "endpoint", "webhook", "ดึงข้อมูล"]],
+    ["places", "Places & Location", "Search for places and send map locations", null, ["places"], "non-ai", ["สถานที่", "ที่ไหน", "location", "map", "แผนที่", "ร้าน", "ที่อยู่", "พิกัด", "ใกล้", "อยู่ตรงไหน"]],
+    ["webapp", "Web App & Code Runner", "Generate HTML apps/games or run Python scripts", null, ["webapp"], "non-ai", ["เกม", "game", "เขียนโปรแกรม", "webapp", "app", "เล่น", "tetris", "snake", "quiz", "calculator", "python", "โค้ด", "คำนวณ", "chart", "กราฟ"]],
+    ["user_profile_mgmt", "User Profile", "Get and set user preferences and personal info", null, ["user_profile"], "non-ai", ["ชื่อ", "เรียกว่า", "name", "nickname", "ชื่อเล่น", "preference", "profile"]],
+  ];
+
+  const now = new Date().toISOString();
+  const defaultAgent = db.prepare("SELECT id FROM agents WHERE is_default = 1 LIMIT 1").get() as any;
+  let added = 0;
+
+  for (const [id, name, desc, hint, tools, toolType, keywords] of expectedSkills) {
+    const exists = db.prepare("SELECT 1 FROM skills WHERE id = ?").get(id);
+    if (!exists) {
+      db.prepare(`
+        INSERT INTO skills (id, name, description, prompt_hint, tools, tool_type, keywords, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(id, name, desc, hint, JSON.stringify(tools), toolType, JSON.stringify(keywords), now);
+
+      // Link to default agent
+      if (defaultAgent) {
+        db.prepare("INSERT OR IGNORE INTO agent_skills (agent_id, skill_id, priority) VALUES (?, ?, ?)").run(defaultAgent.id, id, 5);
+      }
+      added++;
+    } else {
+      // Update tools and tool_type if skill exists but has stale data
+      db.prepare("UPDATE skills SET tools = ?, tool_type = ? WHERE id = ?").run(JSON.stringify(tools), toolType, id);
+    }
+  }
+
+  if (added > 0) {
+    console.log(`[agents] Migration: added ${added} missing skills`);
+  }
 }
 
 // ===== Seed Data =====
@@ -78,6 +137,14 @@ function seedDefaults(db: ReturnType<typeof getDb>): void {
     ["coding", "Coding", "Write and analyze code", null, [], "ai", ["code", "โค้ด", "program", "debug", "function", "เขียนโค้ด"]],
     ["writing", "Writing", "Write, summarize, and translate text", null, [], "ai", ["เขียน", "write", "สรุป", "summarize", "แปล", "translate"]],
     ["browser", "Browser Control", "Control browser and take screenshots", null, ["browser"], "non-ai", ["browser", "เปิดเว็บ", "screenshot", "เว็บ"]],
+    ["email", "Email", "Read, send, and manage Gmail", null, ["gmail", "google_link"], "non-ai", ["อีเมล", "email", "inbox", "ส่งเมล", "gmail", "mail"]],
+    ["calendar_mgmt", "Calendar", "Manage Google Calendar events", null, ["calendar", "google_link"], "non-ai", ["ปฏิทิน", "calendar", "นัด", "event", "meeting", "นัดหมาย"]],
+    ["cloud_storage", "Cloud Storage", "Manage files in Google Drive", null, ["drive", "google_link"], "non-ai", ["ไดรฟ์", "drive", "ไฟล์", "upload", "อัพโหลด", "file"]],
+    ["spreadsheet", "Spreadsheet", "Read and write Google Sheets", null, ["sheets", "google_link"], "non-ai", ["ชีท", "sheets", "excel", "ตาราง", "spreadsheet", "ข้อมูล"]],
+    ["api_integration", "API Integration", "Call external REST APIs", null, ["custom_api"], "non-ai", ["api", "เรียก", "fetch", "endpoint", "webhook", "ดึงข้อมูล"]],
+    ["places", "Places & Location", "Search for places and send map locations", null, ["places"], "non-ai", ["สถานที่", "ที่ไหน", "location", "map", "แผนที่", "ร้าน", "ที่อยู่", "พิกัด", "ใกล้", "อยู่ตรงไหน"]],
+    ["webapp", "Web App & Code Runner", "Generate HTML apps/games or run Python scripts", null, ["webapp"], "non-ai", ["เกม", "game", "เขียนโปรแกรม", "webapp", "app", "เล่น", "tetris", "snake", "quiz", "calculator", "python", "โค้ด", "คำนวณ", "chart", "กราฟ"]],
+    ["user_profile_mgmt", "User Profile", "Get and set user preferences and personal info", null, ["user_profile"], "non-ai", ["ชื่อ", "เรียกว่า", "name", "nickname", "ชื่อเล่น", "preference", "profile"]],
   ];
 
   const insertSkill = db.prepare(`
@@ -93,7 +160,8 @@ function seedDefaults(db: ReturnType<typeof getDb>): void {
   const geminiPriorities: Record<string, number> = {
     general_chat: 10, image_analysis: 10, image_creation: 8, audio_video: 10,
     tts: 10, web_research: 8, scheduling: 5, memory: 5, messaging: 5,
-    coding: 5, writing: 6, browser: 5,
+    coding: 5, writing: 6, browser: 5, email: 5, calendar_mgmt: 5,
+    cloud_storage: 5, spreadsheet: 5, api_integration: 5,
   };
 
   for (const [id, name, desc, hint, tools, toolType, keywords] of skills) {
@@ -113,6 +181,7 @@ function rowToAgent(row: any): AgentConfig {
     description: row.description || "",
     provider: row.provider,
     model: row.model,
+    apiKey: row.api_key || null,
     systemPrompt: row.system_prompt || null,
     enabled: !!row.enabled,
     isDefault: !!row.is_default,
@@ -169,15 +238,15 @@ export function getAgent(dataDir: string, id: string): AgentConfig | null {
 
 export function createAgent(dataDir: string, input: {
   id: string; name: string; description?: string;
-  provider: string; model: string; systemPrompt?: string;
+  provider: string; model: string; apiKey?: string; systemPrompt?: string;
 }): AgentConfig {
   ensureAgentsTables(dataDir);
   const db = getDb(dataDir);
   const now = new Date().toISOString();
   db.prepare(`
-    INSERT INTO agents (id, name, description, provider, model, system_prompt, enabled, is_default, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
-  `).run(input.id, input.name, input.description || "", input.provider, input.model, input.systemPrompt || null, now, now);
+    INSERT INTO agents (id, name, description, provider, model, api_key, system_prompt, enabled, is_default, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+  `).run(input.id, input.name, input.description || "", input.provider, input.model, input.apiKey || null, input.systemPrompt || null, now, now);
 
   // Auto-assign non-AI skills ให้ agent ใหม่ (เครื่องมือพื้นฐาน ไม่กิน tokens)
   const nonAiSkills = db.prepare("SELECT id FROM skills WHERE tool_type = 'non-ai'").all() as Array<{ id: string }>;
@@ -192,7 +261,7 @@ export function createAgent(dataDir: string, input: {
 
 export function updateAgent(dataDir: string, id: string, partial: Partial<{
   name: string; description: string; provider: string; model: string;
-  systemPrompt: string | null; enabled: boolean;
+  apiKey: string | null; systemPrompt: string | null; enabled: boolean;
 }>): AgentConfig | null {
   ensureAgentsTables(dataDir);
   const db = getDb(dataDir);
@@ -207,6 +276,7 @@ export function updateAgent(dataDir: string, id: string, partial: Partial<{
   if (partial.description !== undefined) { sets.push("description = ?"); vals.push(partial.description); }
   if (partial.provider !== undefined) { sets.push("provider = ?"); vals.push(partial.provider); }
   if (partial.model !== undefined) { sets.push("model = ?"); vals.push(partial.model); }
+  if (partial.apiKey !== undefined) { sets.push("api_key = ?"); vals.push(partial.apiKey); }
   if (partial.systemPrompt !== undefined) { sets.push("system_prompt = ?"); vals.push(partial.systemPrompt); }
   if (partial.enabled !== undefined) { sets.push("enabled = ?"); vals.push(partial.enabled ? 1 : 0); }
 
@@ -331,6 +401,21 @@ export function recommendAgent(dataDir: string, message: string): RecommendResul
   };
 }
 
+// ===== Resolve best agent for a skill (used by planner) =====
+
+export function resolveAgentForSkill(dataDir: string, skillId: string): string | null {
+  ensureAgentsTables(dataDir);
+  const db = getDb(dataDir);
+  const row = db.prepare(`
+    SELECT a.id FROM agents a
+    JOIN agent_skills ask ON ask.agent_id = a.id
+    WHERE ask.skill_id = ? AND a.enabled = 1
+    ORDER BY ask.priority DESC
+    LIMIT 1
+  `).get(skillId) as { id: string } | undefined;
+  return row?.id ?? null;
+}
+
 // ===== Agents with skills (for API) =====
 
 export function listAgentsWithSkills(dataDir: string): AgentConfig[] {
@@ -339,4 +424,62 @@ export function listAgentsWithSkills(dataDir: string): AgentConfig[] {
     ...a,
     skills: getAgentSkills(dataDir, a.id),
   }));
+}
+
+// ===== Agent Activity Log =====
+
+export function logAgentActivity(dataDir: string, entry: {
+  agentId: string;
+  type: "delegate" | "tool_call" | "response";
+  userId?: string;
+  task?: string;
+  detail?: string;
+  status?: "ok" | "error";
+}): void {
+  try {
+    ensureAgentsTables(dataDir);
+    const db = getDb(dataDir);
+    db.prepare(`
+      INSERT INTO agent_logs (agent_id, type, user_id, task, detail, status)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      entry.agentId,
+      entry.type,
+      entry.userId || null,
+      entry.task || null,
+      entry.detail ? entry.detail.substring(0, 500) : null,
+      entry.status || "ok",
+    );
+  } catch (err) {
+    console.error("[agent_logs] Failed to log:", err);
+  }
+}
+
+export function getAgentLogs(dataDir: string, agentId: string, limit = 50, offset = 0): {
+  logs: Array<{
+    id: number; agentId: string; type: string; userId: string | null;
+    task: string | null; detail: string | null; status: string; createdAt: string;
+  }>;
+  total: number;
+} {
+  ensureAgentsTables(dataDir);
+  const db = getDb(dataDir);
+  const total = (db.prepare("SELECT COUNT(*) as cnt FROM agent_logs WHERE agent_id = ?").get(agentId) as any)?.cnt || 0;
+  const rows = db.prepare(`
+    SELECT * FROM agent_logs WHERE agent_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?
+  `).all(agentId, limit, offset) as any[];
+
+  return {
+    logs: rows.map((r) => ({
+      id: r.id,
+      agentId: r.agent_id,
+      type: r.type,
+      userId: r.user_id,
+      task: r.task,
+      detail: r.detail,
+      status: r.status,
+      createdAt: r.created_at,
+    })),
+    total,
+  };
 }

@@ -17,6 +17,7 @@
 
 import type { ToolDefinition, ToolContext } from "./types.js";
 import { getDb } from "../memory/store.js";
+import { emitDashboardEvent } from "../admin/events.js";
 
 // ===== In-memory log buffer =====
 const LOG_BUFFER_SIZE = 500;
@@ -28,16 +29,20 @@ const origError = console.error;
 
 console.log = (...args: unknown[]) => {
   const msg = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
-  logBuffer.push({ ts: new Date().toISOString(), level: "info", msg });
+  const ts = new Date().toISOString();
+  logBuffer.push({ ts, level: "info", msg });
   if (logBuffer.length > LOG_BUFFER_SIZE) logBuffer.shift();
   origLog.apply(console, args);
+  emitDashboardEvent("log", { ts, level: "info", msg: msg.length > 500 ? msg.substring(0, 500) : msg });
 };
 
 console.error = (...args: unknown[]) => {
   const msg = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
-  logBuffer.push({ ts: new Date().toISOString(), level: "error", msg });
+  const ts = new Date().toISOString();
+  logBuffer.push({ ts, level: "error", msg });
   if (logBuffer.length > LOG_BUFFER_SIZE) logBuffer.shift();
   origError.apply(console, args);
+  emitDashboardEvent("log", { ts, level: "error", msg: msg.length > 500 ? msg.substring(0, 500) : msg });
 };
 
 // ===== Runtime config overrides =====

@@ -90,7 +90,7 @@ export const memorySearchTool: ToolDefinition = {
         index: i + 1,
         score: Number(r.score.toFixed(3)),
         source: r.source, // "vector" | "keyword" | "hybrid"
-        who: r.chunk.source, // "user" | "assistant"
+        who: r.chunk.source, // "user" | "assistant" | "knowledge"
         text: r.chunk.text.length > 700 ? r.chunk.text.substring(0, 700) + "..." : r.chunk.text,
         date: new Date(r.chunk.createdAt).toISOString(),
       }));
