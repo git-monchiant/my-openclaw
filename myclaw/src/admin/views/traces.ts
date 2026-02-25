@@ -183,113 +183,118 @@ function renderTraceDetail(traceId){
 }
 
 function renderTreeNodes(nodes, isRunning){
-  var html = '';
+  var html = '<div style="position:relative;padding-left:20px">';
+  // vertical connector line
+  html += '<div style="position:absolute;left:7px;top:10px;bottom:10px;width:2px;background:var(--border)"></div>';
+
   for(var i=0; i<nodes.length; i++){
     var node = nodes[i];
+    var isLast = i === nodes.length - 1 && !isRunning;
 
     if(node.type === 'receive'){
-      html += treeBox('&#x1F4E8;', 'Message', esc(node.step.detail || ''), '#64748b', null, fmtStepTime(node.step));
+      html += treeRow('&#x1F4E8;', 'Message', esc(node.step.detail||''), '#64748b', fmtStepTime(node.step), isLast);
     }
     else if(node.type === 'thinking'){
-      html += treeBox('&#x1F9E0;', 'Orchestrator', 'Thinking...', '#3b82f6', null, fmtStepTime(node.step));
+      html += treeRow('&#x1F9E0;', 'Orchestrator', 'Thinking...', '#3b82f6', fmtStepTime(node.step), isLast);
     }
     else if(node.type === 'agent_phase'){
-      html += renderAgentPhase(node);
+      html += renderAgentPhase(node, isLast);
     }
     else if(node.type === 'respond'){
-      var respText = node.step.detail ? esc(node.step.detail) : 'Response sent';
-      html += treeBox('&#x1F4AC;', 'Response', respText, '#06b6d4', null, fmtStepTime(node.step));
+      html += treeRow('&#x1F4AC;', 'Response', node.step.detail ? esc(node.step.detail) : 'Response sent', '#06b6d4', fmtStepTime(node.step), isLast);
     }
     else {
-      // Fallback for unrecognized
-      html += treeBox('&#x2022;', node.type, esc(node.step?.detail||''), 'var(--muted)', null, node.step ? fmtStepTime(node.step) : '');
+      html += treeRow('&#x2022;', node.type, esc(node.step?.detail||''), 'var(--muted)', node.step ? fmtStepTime(node.step) : '', isLast);
     }
   }
-  // Running indicator
+
   if(isRunning){
-    html += '<div style="display:flex;align-items:center;gap:8px;padding:8px 0;color:var(--muted);font-size:12px">' +
-      '<span style="width:10px;height:10px;border-radius:50%;background:var(--accent);animation:pulse-anim 1.5s infinite;flex-shrink:0"></span>' +
-      'Processing...' +
+    html += '<div style="display:flex;align-items:center;gap:8px;padding:6px 0 2px 0;color:var(--muted);font-size:12px">' +
+      '<span style="position:absolute;left:2px;width:12px;height:12px;border-radius:50%;background:var(--accent);animation:pulse-anim 1.5s infinite;border:2px solid var(--bg)"></span>' +
+      '<span style="margin-left:4px">Processing...</span>' +
     '</div>';
   }
+
+  html += '</div>';
   return html;
 }
 
-function renderAgentPhase(phase){
+function treeRow(icon, label, content, color, timeStr, isLast){
+  return '<div style="position:relative;margin-bottom:'+(isLast?'0':'6px')+';padding-left:20px">' +
+    // dot on the line
+    '<div style="position:absolute;left:1px;top:8px;width:14px;height:14px;border-radius:50%;background:'+color+';border:2px solid var(--bg);display:flex;align-items:center;justify-content:center;font-size:8px">'+icon+'</div>' +
+    '<div style="background:var(--hover);border-radius:6px;padding:6px 10px">' +
+      '<div style="display:flex;align-items:center;gap:6px">' +
+        '<span style="font-weight:600;font-size:12px;color:'+color+'">'+label+'</span>' +
+        (timeStr ? '<span style="font-size:10px;color:var(--muted);margin-left:auto">'+timeStr+'</span>' : '') +
+      '</div>' +
+      (content ? '<div style="font-size:11px;color:var(--text);opacity:0.8;margin-top:2px;word-break:break-word">'+content+'</div>' : '') +
+    '</div>' +
+  '</div>';
+}
+
+function renderAgentPhase(phase, isLast){
   var agent = phase.agent || 'agent';
   var delegateDetail = phase.delegateStep.detail || '';
   var elapsed = phase.resultStep?.elapsed;
   var elapsedStr = elapsed ? (elapsed/1000).toFixed(1)+'s' : '';
   var isError = phase.resultStep?.type === 'error';
-  var borderColor = isError ? '#ef4444' : '#8b5cf6';
+  var color = isError ? '#ef4444' : '#8b5cf6';
 
-  // Agent container (compact)
-  var html = '<div style="margin:3px 0;border-left:3px solid '+borderColor+';border-radius:0 6px 6px 0;background:'+borderColor+'08">';
+  var html = '<div style="position:relative;margin-bottom:'+(isLast?'0':'6px')+';padding-left:20px">' +
+    // dot
+    '<div style="position:absolute;left:1px;top:8px;width:14px;height:14px;border-radius:50%;background:'+color+';border:2px solid var(--bg);display:flex;align-items:center;justify-content:center;font-size:8px">&#x1F916;</div>' +
+    // agent box
+    '<div style="border:1px solid '+color+'40;border-radius:6px;background:'+color+'08">' +
+      // header
+      '<div style="padding:6px 10px;display:flex;align-items:center;gap:6px;border-bottom:1px solid '+color+'20">' +
+        '<span style="font-weight:700;font-size:12px;color:'+color+'">'+esc(agent)+'</span>' +
+        (delegateDetail ? '<span style="font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px">'+esc(delegateDetail)+'</span>' : '') +
+        (elapsedStr ? '<span style="font-size:10px;color:var(--muted);margin-left:auto;flex-shrink:0">'+elapsedStr+'</span>' : '') +
+      '</div>';
 
-  // Agent header
-  html += '<div style="padding:6px 10px;display:flex;align-items:center;gap:6px">' +
-    '<span style="font-size:12px">&#x1F916;</span>' +
-    '<span style="font-weight:700;font-size:12px;color:'+borderColor+'">'+esc(agent)+'</span>' +
-    (elapsedStr ? '<span style="font-size:10px;color:var(--muted);margin-left:auto">'+elapsedStr+'</span>' : '') +
-  '</div>';
-
-  // Task description
-  if(delegateDetail){
-    html += '<div style="padding:0 10px 4px;font-size:11px;color:var(--text);opacity:0.8">' +
-      esc(delegateDetail) +
-    '</div>';
-  }
-
-  // Children (thinking, tool calls inside the agent)
+  // Children (inner steps) with own indent tree
   if(phase.children.length > 0){
-    html += '<div style="padding:0 10px 2px;margin-left:10px;border-left:2px solid var(--border)">';
+    html += '<div style="position:relative;padding:4px 10px 4px 28px">' +
+      '<div style="position:absolute;left:18px;top:6px;bottom:6px;width:2px;background:'+color+'30"></div>';
     for(var j=0; j<phase.children.length; j++){
       var c = phase.children[j];
-      if(c.type === 'thinking'){
-        html += miniStep('&#x1F9E0;', 'Thinking', '#3b82f6', fmtStepElapsed(c));
-      } else if(c.type === 'tool_call'){
-        html += miniStep('&#x1F527;', c.tool || 'tool', '#f59e0b', fmtStepElapsed(c), c.detail);
-      } else if(c.type === 'delegate'){
-        html += miniStep('&#x1F4E4;', 'delegate → '+(c.agent||'?'), '#8b5cf6', fmtStepElapsed(c), c.detail);
-      } else {
-        html += miniStep('&#x2022;', c.type+(c.tool?': '+c.tool:''), 'var(--muted)', fmtStepElapsed(c), c.detail);
-      }
+      var cIsLast = j === phase.children.length - 1;
+      var cIcon = c.type==='thinking' ? '&#x1F9E0;' : c.type==='tool_call' ? '&#x1F527;' : '&#x2022;';
+      var cColor = c.type==='thinking' ? '#3b82f6' : c.type==='tool_call' ? '#f59e0b' : 'var(--muted)';
+      var cLabel = c.type==='thinking' ? 'Thinking' : (c.tool || c.type);
+      html += '<div style="position:relative;padding-left:16px;margin-bottom:'+(cIsLast?'0':'3px')+'">' +
+        '<div style="position:absolute;left:1px;top:6px;width:10px;height:10px;border-radius:50%;background:'+cColor+';border:2px solid var(--bg)"></div>' +
+        '<div style="display:flex;align-items:center;gap:6px;padding:3px 0">' +
+          '<span style="font-size:11px;color:'+cColor+';font-weight:500">'+cIcon+' '+esc(cLabel)+'</span>' +
+          (c.elapsed ? '<span style="font-size:10px;color:var(--muted);margin-left:auto">'+(c.elapsed/1000).toFixed(1)+'s</span>' : '') +
+        '</div>' +
+        (c.detail ? '<div style="font-size:10px;color:var(--muted);padding-left:4px;word-break:break-word">'+esc(c.detail)+'</div>' : '') +
+      '</div>';
     }
     html += '</div>';
   }
 
-  // Result (compact)
+  // Result
   if(phase.resultStep){
     var rs = phase.resultStep;
     if(rs.type === 'error'){
-      html += '<div style="padding:2px 10px 6px">' +
-        '<div style="font-size:11px;padding:4px 8px;background:#ef444415;border-radius:4px;border:1px solid #ef444430;color:#ef4444">' +
-          '&#x274C; ' + esc(rs.detail || 'Error') +
-        '</div></div>';
-    } else if(rs.result) {
-      html += '<div style="padding:2px 10px 6px">' +
-        '<div style="font-size:11px;padding:4px 8px;background:var(--bg);border-radius:4px;border:1px solid var(--border);white-space:pre-wrap;word-break:break-word;color:var(--text)">' +
-          '&#x2705; ' + esc(rs.result) +
-        '</div></div>';
+      html += '<div style="padding:4px 10px 6px">' +
+        '<div style="font-size:11px;padding:4px 8px;background:#ef444415;border-radius:4px;border:1px solid #ef444430;color:#ef4444">&#x274C; '+esc(rs.detail||'Error')+'</div>' +
+      '</div>';
+    } else if(rs.result){
+      html += '<div style="padding:4px 10px 6px">' +
+        '<div style="font-size:11px;padding:6px 8px;background:var(--bg);border-radius:4px;border:1px solid var(--border);white-space:pre-wrap;word-break:break-word;color:var(--text);max-height:200px;overflow-y:auto">&#x2705; '+esc(rs.result)+'</div>' +
+      '</div>';
     }
   }
 
-  html += '</div>';
+  html += '</div></div>';
   return html;
 }
 
 function treeBox(icon, label, content, color, children, timeStr){
-  var html = '<div style="margin:3px 0;padding:6px 10px;border-radius:6px;background:var(--hover);border-left:3px solid '+color+'">' +
-    '<div style="display:flex;align-items:center;gap:6px">' +
-      '<span style="font-size:12px">'+icon+'</span>' +
-      '<span style="font-weight:600;font-size:12px;color:'+color+'">'+label+'</span>' +
-      (timeStr ? '<span style="font-size:10px;color:var(--muted);margin-left:auto">'+timeStr+'</span>' : '') +
-    '</div>';
-  if(content){
-    html += '<div style="font-size:11px;color:var(--text);opacity:0.8;margin-top:2px">' + content + '</div>';
-  }
-  html += '</div>';
-  return html;
+  return treeRow(icon, label, content, color, timeStr, false);
 }
 
 function miniStep(icon, label, color, elapsed, detail){
@@ -299,7 +304,7 @@ function miniStep(icon, label, color, elapsed, detail){
     (elapsed ? '<span style="font-size:10px;color:var(--muted);margin-left:auto">'+elapsed+'</span>' : '') +
   '</div>';
   if(detail){
-    html += '<div style="padding:0 8px 2px 25px;font-size:10px;color:var(--muted)">' + esc(detail) + '</div>';
+    html += '<div style="padding:0 8px 2px 25px;font-size:10px;color:var(--muted)">'+esc(detail)+'</div>';
   }
   return html;
 }

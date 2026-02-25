@@ -268,13 +268,7 @@ async function processMessage(event: MessageEvent): Promise<ProcessedMessage | n
       try {
         const media = await downloadLineMedia(message.id, config.channelAccessToken);
         console.log(`[LINE] Downloaded image: ${media.mimeType} (${media.size} bytes)`);
-        return { text: `[User sent an image — analyze it carefully.
-If it contains text, documents, worksheets, or problems: read and transcribe ALL content thoroughly. Reply as:
-📖 เนื้อหา:
-(complete text extraction — this will be needed for follow-up questions)
-📋 สรุป:
-(brief overview of what's in the image, then ask what the user wants you to do)
-For photos/visuals without significant text: describe what you see in detail (people: how many, positions left/right/center, appearance, clothing; setting and background; notable objects). Then ask what the user wants you to do with it.]`, media };
+        return { text: `[media:image mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`, media };
       } catch (err) {
         console.error("[LINE] Image download failed:", err);
         return { text: "[User sent an image that could not be downloaded]" };
@@ -285,12 +279,7 @@ For photos/visuals without significant text: describe what you see in detail (pe
       try {
         const media = await downloadLineMedia(message.id, config.channelAccessToken, MEDIA_LIMITS.video, "video/mp4");
         console.log(`[LINE] Downloaded video: ${media.mimeType} (${media.size} bytes)`);
-        return { text: `[User sent a video — analyze it carefully.
-Watch the ENTIRE video from start to finish and describe:
-📹 เนื้อหา:
-(complete description — scenes, actions, people, locations, dialogue/speech transcription, text on screen, timeline of events from beginning to end)
-📋 สรุป:
-(brief 2-3 sentence overview of the video, then ask what the user wants you to do with it — e.g., transcribe dialogue, summarize, translate, analyze further)]`, media };
+        return { text: `[media:video mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`, media };
       } catch (err: any) {
         console.error("[LINE] Video download failed:", err);
         const limitMB = Math.round(MEDIA_LIMITS.video / (1024 * 1024));
@@ -305,11 +294,7 @@ Watch the ENTIRE video from start to finish and describe:
       try {
         const media = await downloadLineMedia(message.id, config.channelAccessToken, MEDIA_LIMITS.audio, "audio/mp4");
         console.log(`[LINE] Downloaded audio: ${media.mimeType} (${media.size} bytes)`);
-        return { text: `[User sent an audio message — listen carefully to the entire recording.
-🎙️ เนื้อหา:
-(full transcription of all speech — who's talking, language, every sentence/phrase spoken, background sounds, mood/tone)
-📋 สรุป:
-(brief overview — topic, speakers, duration estimate, then ask what the user wants you to do with it — e.g., translate, summarize, extract key points)]`, media };
+        return { text: `[media:audio mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`, media };
       } catch (err: any) {
         console.error("[LINE] Audio download failed:", err);
         const limitMB = Math.round(MEDIA_LIMITS.audio / (1024 * 1024));
@@ -350,11 +335,7 @@ Watch the ENTIRE video from start to finish and describe:
           const mimeMap: Record<string, string> = { m4a: "audio/mp4", mp3: "audio/mpeg", wav: "audio/wav", aac: "audio/aac", ogg: "audio/ogg", flac: "audio/flac", opus: "audio/opus", wma: "audio/x-ms-wma", webm: "audio/webm" };
           const media = await downloadLineMedia(message.id, config.channelAccessToken, MEDIA_LIMITS.audio, mimeMap[ext] || "audio/mp4");
           console.log(`[LINE] Downloaded audio file: ${fileName} ${media.mimeType} (${media.size} bytes)`);
-          return { text: `[User sent an audio file: ${fileName} — listen carefully to the entire recording.
-🎙️ เนื้อหา:
-(full transcription of all speech — who's talking, language, every sentence/phrase spoken, background sounds, mood/tone)
-📋 สรุป:
-(brief overview — topic, speakers, duration estimate, then ask what the user wants you to do with it — e.g., translate, summarize, extract key points)]`, media };
+          return { text: `[media:audio filename="${fileName}" mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`, media };
         } catch (err: any) {
           console.error(`[LINE] Audio file download failed (${fileName}):`, err);
           const limitMB = Math.round(MEDIA_LIMITS.audio / (1024 * 1024));
@@ -371,12 +352,7 @@ Watch the ENTIRE video from start to finish and describe:
         try {
           const media = await downloadLineMedia(message.id, config.channelAccessToken, MEDIA_LIMITS.video, "video/mp4");
           console.log(`[LINE] Downloaded video file: ${fileName} ${media.mimeType} (${media.size} bytes)`);
-          return { text: `[User sent a video file: ${fileName} — analyze it carefully.
-Watch the ENTIRE video from start to finish and describe:
-📹 เนื้อหา:
-(complete description — scenes, actions, people, locations, dialogue/speech transcription, text on screen, timeline of events from beginning to end)
-📋 สรุป:
-(brief 2-3 sentence overview of the video, then ask what the user wants you to do with it — e.g., transcribe dialogue, summarize, translate, analyze further)]`, media };
+          return { text: `[media:video filename="${fileName}" mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`, media };
         } catch (err: any) {
           console.error(`[LINE] Video file download failed (${fileName}):`, err);
           const limitMB = Math.round(MEDIA_LIMITS.video / (1024 * 1024));

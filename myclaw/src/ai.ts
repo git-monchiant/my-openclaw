@@ -898,13 +898,36 @@ async function chatOpenAICompat(
     messages.push({ role: m.role, content: m.content });
   }
 
-  // User message + optional vision (OpenAI format: content array with image_url)
+  // User message + optional multimodal (OpenAI/OpenRouter format)
+  // image → image_url, audio → input_audio, video → video_url
+  const AUDIO_FORMAT: Record<string, string> = {
+    "audio/mp4": "m4a", "audio/mpeg": "mp3", "audio/wav": "wav",
+    "audio/aac": "aac", "audio/ogg": "ogg", "audio/flac": "flac",
+    "audio/opus": "ogg", "audio/webm": "webm", "audio/x-ms-wma": "wav",
+  };
   if (media && media.mimeType.startsWith("image/") && cfg.supportsVision !== false) {
     messages.push({
       role: "user",
       content: [
         { type: "text", text: message },
         { type: "image_url", image_url: { url: `data:${media.mimeType};base64,${media.buffer.toString("base64")}` } },
+      ],
+    });
+  } else if (media && media.mimeType.startsWith("audio/") && cfg.supportsVision !== false) {
+    const fmt = AUDIO_FORMAT[media.mimeType] || "mp3";
+    messages.push({
+      role: "user",
+      content: [
+        { type: "text", text: message },
+        { type: "input_audio", input_audio: { data: media.buffer.toString("base64"), format: fmt } },
+      ],
+    });
+  } else if (media && media.mimeType.startsWith("video/") && cfg.supportsVision !== false) {
+    messages.push({
+      role: "user",
+      content: [
+        { type: "text", text: message },
+        { type: "video_url", video_url: { url: `data:${media.mimeType};base64,${media.buffer.toString("base64")}` } },
       ],
     });
   } else {
