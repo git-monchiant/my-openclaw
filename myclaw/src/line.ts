@@ -27,6 +27,58 @@ const MEDIA_LIMITS = {
   video: 10 * 1024 * 1024,   // 10MB
 };
 
+// ===== Pending Media (รอ instruction จาก user ก่อน process) =====
+
+type PendingMediaType = "image" | "video" | "audio" | "document";
+
+interface PendingMedia {
+  media: MediaData;
+  type: PendingMediaType;
+  filename?: string;
+  sizeKB: number;
+  ts: number;
+}
+
+const pendingMedia = new Map<string, PendingMedia>();
+const PENDING_MEDIA_TTL = 5 * 60 * 1000; // 5 นาที
+
+function storePendingMedia(userId: string, media: MediaData, type: PendingMediaType, filename?: string) {
+  pendingMedia.set(userId, { media, type, filename, sizeKB: Math.round(media.size / 1024), ts: Date.now() });
+}
+
+// ===== Recent Media Cache (binary in memory — fast path for follow-up) =====
+// DB (line_messages) เป็น fallback ถ้า memory miss (restart / TTL หมด)
+
+interface RecentMedia {
+  media: MediaData;
+  type: PendingMediaType;
+  filename?: string;
+  ts: number;
+}
+
+const recentMediaCache = new Map<string, RecentMedia>();
+const RECENT_MEDIA_TTL = 30 * 60 * 1000; // 30 นาที
+
+function storeRecentMedia(userId: string, media: MediaData, type: PendingMediaType, filename?: string) {
+  recentMediaCache.set(userId, { media, type, filename, ts: Date.now() });
+}
+
+function buildMediaAskText(type: PendingMediaType, filename?: string, sizeKB?: number): string {
+  const label = { image: "รูปภาพ", video: "วิดีโอ", audio: "ไฟล์เสียง", document: "PDF" }[type];
+  const fileInfo = filename ? `"${filename}" ` : "";
+  const sizeStr = sizeKB ? (sizeKB < 1024 ? `${sizeKB}KB` : `${Math.round(sizeKB / 1024)}MB`) : "";
+  const suggestions: Record<PendingMediaType, string> = {
+    image:    "describe/analyze it, read text in the image (OCR), identify objects/places/people, or anything else",
+    video:    "describe the content, transcribe speech, summarize, or anything else",
+    audio:    "transcribe to text, translate, summarize, or anything else",
+    document: "summarize, translate, answer questions from it, or read it aloud (TTS)",
+  };
+  const docExtra = type === "document"
+    ? ` Also briefly guess what kind of document it is from the filename${filename ? ` "${filename}"` : ""} — weave it naturally into the message.`
+    : "";
+  return `[SYSTEM: User sent ${label} ${fileInfo}${sizeStr ? `(${sizeStr}) ` : ""}— DO NOT analyze yet. Respond in Thai in a friendly, conversational tone. Acknowledge receipt, then naturally ask what they'd like to do — suggestions: ${suggestions[type]}. Do NOT use a numbered list. Write it as natural flowing speech, like a helpful assistant would say it.${docExtra}]`;
+}
+
 export const lineClient = new messagingApi.MessagingApiClient({
   channelAccessToken: config.channelAccessToken,
 });
@@ -161,7 +213,7 @@ interface ProcessedMessage {
 // ใช้ SQLite เพื่อให้ persist ข้าม restart (in-memory cache ด้านบน สำหรับ hot path)
 const _messageCache = new Map<string, string>(); // in-memory cache
 const MSG_CACHE_MAX = 200;
-const MSG_DB_TTL_HOURS = 24; // เก็บใน DB 24 ชม.
+const MSG_DB_TTL_HOURS = 720; // เก็บใน DB 30 วัน (ตาม LINE media expiry)
 
 const DATA_DIR = process.env.DATA_DIR || "./data";
 
@@ -172,32 +224,53 @@ function ensureMsgTable(): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS line_messages (
       id TEXT PRIMARY KEY,
+      user_id TEXT,
       text TEXT NOT NULL,
       created_at TEXT DEFAULT (datetime('now'))
     )
   `);
-  // Cleanup เก่ากว่า 24 ชม.
+  // Migration: add user_id if missing (existing DB)
+  try { db.exec(`ALTER TABLE line_messages ADD COLUMN user_id TEXT`); } catch { /* already exists */ }
+  // Cleanup เก่ากว่า TTL
   db.prepare(`DELETE FROM line_messages WHERE created_at < datetime('now', '-${MSG_DB_TTL_HOURS} hours')`).run();
   _msgTableReady = true;
 }
 
-function storeMessage(messageId: string, text: string): void {
+function storeMessage(messageId: string, text: string, userId?: string): void {
   console.log(`[msg-store] Storing: id=${messageId} text="${text.substring(0, 60)}..."`);
-  // In-memory cache
   _messageCache.set(messageId, text);
   if (_messageCache.size > MSG_CACHE_MAX) {
     const first = _messageCache.keys().next().value;
     if (first) _messageCache.delete(first);
   }
-  // SQLite persist
   try {
     ensureMsgTable();
     getDb(DATA_DIR).prepare(
-      "INSERT OR REPLACE INTO line_messages (id, text) VALUES (?, ?)"
-    ).run(messageId, text);
+      "INSERT OR REPLACE INTO line_messages (id, user_id, text) VALUES (?, ?, ?)"
+    ).run(messageId, userId ?? null, text);
   } catch (err) {
     console.error(`[msg-store] DB error:`, err);
   }
+}
+
+/** หา media message ล่าสุดของ user (สำหรับ follow-up re-download) */
+function getLastMediaMessage(userId: string): { messageId: string; type: PendingMediaType; mimeType: string; filename?: string } | undefined {
+  try {
+    ensureMsgTable();
+    const row = getDb(DATA_DIR).prepare(
+      `SELECT text FROM line_messages WHERE user_id = ? AND text LIKE '[media:%' ORDER BY created_at DESC LIMIT 1`
+    ).get(userId) as { text: string } | undefined;
+    if (!row) return undefined;
+    const msgIdMatch = row.text.match(/messageId=(\S+)/);
+    const mimeMatch = row.text.match(/mimeType=(\S+)/);
+    const fnMatch = row.text.match(/filename="([^"]+)"/);
+    if (!msgIdMatch || !mimeMatch) return undefined;
+    const type: PendingMediaType = row.text.includes("media:video") ? "video"
+      : row.text.includes("media:audio") ? "audio"
+      : row.text.includes("media:document") ? "document"
+      : "image";
+    return { messageId: msgIdMatch[1], type, mimeType: mimeMatch[1], filename: fnMatch?.[1] };
+  } catch { return undefined; }
 }
 
 function getStoredMessage(messageId: string): string | undefined {
@@ -227,13 +300,14 @@ function getStoredMessage(messageId: string): string | undefined {
 
 async function processMessage(event: MessageEvent): Promise<ProcessedMessage | null> {
   const message = event.message;
+  const userId = event.source.userId;
 
   switch (message.type) {
     case "text": {
       const text = (message as TextEventMessage).text;
 
       // Store message สำหรับ quote lookup
-      storeMessage(message.id, text);
+      storeMessage(message.id, text, userId ?? undefined);
 
       // ดึง quoted message (ถ้า user reply/quote ข้อความ)
       const quotedMessageId = (message as any).quotedMessageId as string | undefined;
@@ -241,6 +315,29 @@ async function processMessage(event: MessageEvent): Promise<ProcessedMessage | n
         const quotedText = getStoredMessage(quotedMessageId);
         if (quotedText) {
           console.log(`[LINE] Quote detected: "${quotedText.substring(0, 50)}..." → "${text.substring(0, 50)}"`);
+
+          // ถ้า quoted message เป็น media → re-download จาก LINE API (ถ้ายังไม่ expired)
+          const mediaQuoteMatch = quotedText.match(/\[media:(image|video|audio) messageId=(\d+)/);
+          if (mediaQuoteMatch) {
+            const mediaType = mediaQuoteMatch[1] as "image" | "video" | "audio";
+            const mediaMessageId = mediaQuoteMatch[2];
+            try {
+              let reMedia: MediaData;
+              if (mediaType === "video") {
+                reMedia = await downloadLineMedia(mediaMessageId, config.channelAccessToken, MEDIA_LIMITS.video, "video/mp4");
+              } else if (mediaType === "audio") {
+                reMedia = await downloadLineMedia(mediaMessageId, config.channelAccessToken, MEDIA_LIMITS.audio, "audio/mp4");
+              } else {
+                reMedia = await downloadLineMedia(mediaMessageId, config.channelAccessToken);
+              }
+              console.log(`[LINE] Re-downloaded quoted ${mediaType}: ${reMedia.mimeType} (${reMedia.size} bytes)`);
+              return { text: `[media:${mediaType} messageId=${mediaMessageId} mimeType=${reMedia.mimeType} size=${Math.round(reMedia.size/1024)}KB re-requested]\n${text}`, media: reMedia };
+            } catch (err) {
+              console.warn(`[LINE] Could not re-download quoted ${mediaType} (expired?):`, err);
+              return { text: `[User is quoting a ${mediaType} message that can no longer be downloaded (may have expired). Inform user.]\n${text}` };
+            }
+          }
+
           return { text: `[User is quoting/replying to this message: "${quotedText}"]\n${text}` };
         } else {
           console.log(`[LINE] Quote detected but original message not found (id: ${quotedMessageId})`);
@@ -268,7 +365,9 @@ async function processMessage(event: MessageEvent): Promise<ProcessedMessage | n
       try {
         const media = await downloadLineMedia(message.id, config.channelAccessToken);
         console.log(`[LINE] Downloaded image: ${media.mimeType} (${media.size} bytes)`);
-        return { text: `[media:image mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`, media };
+        const text = `[media:image messageId=${message.id} mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`;
+        storeMessage(message.id, text, userId ?? undefined);
+        return { text, media };
       } catch (err) {
         console.error("[LINE] Image download failed:", err);
         return { text: "[User sent an image that could not be downloaded]" };
@@ -279,7 +378,9 @@ async function processMessage(event: MessageEvent): Promise<ProcessedMessage | n
       try {
         const media = await downloadLineMedia(message.id, config.channelAccessToken, MEDIA_LIMITS.video, "video/mp4");
         console.log(`[LINE] Downloaded video: ${media.mimeType} (${media.size} bytes)`);
-        return { text: `[media:video mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`, media };
+        const text = `[media:video messageId=${message.id} mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`;
+        storeMessage(message.id, text, userId ?? undefined);
+        return { text, media };
       } catch (err: any) {
         console.error("[LINE] Video download failed:", err);
         const limitMB = Math.round(MEDIA_LIMITS.video / (1024 * 1024));
@@ -294,7 +395,9 @@ async function processMessage(event: MessageEvent): Promise<ProcessedMessage | n
       try {
         const media = await downloadLineMedia(message.id, config.channelAccessToken, MEDIA_LIMITS.audio, "audio/mp4");
         console.log(`[LINE] Downloaded audio: ${media.mimeType} (${media.size} bytes)`);
-        return { text: `[media:audio mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`, media };
+        const text = `[media:audio messageId=${message.id} mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`;
+        storeMessage(message.id, text, userId ?? undefined);
+        return { text, media };
       } catch (err: any) {
         console.error("[LINE] Audio download failed:", err);
         const limitMB = Math.round(MEDIA_LIMITS.audio / (1024 * 1024));
@@ -335,7 +438,9 @@ async function processMessage(event: MessageEvent): Promise<ProcessedMessage | n
           const mimeMap: Record<string, string> = { m4a: "audio/mp4", mp3: "audio/mpeg", wav: "audio/wav", aac: "audio/aac", ogg: "audio/ogg", flac: "audio/flac", opus: "audio/opus", wma: "audio/x-ms-wma", webm: "audio/webm" };
           const media = await downloadLineMedia(message.id, config.channelAccessToken, MEDIA_LIMITS.audio, mimeMap[ext] || "audio/mp4");
           console.log(`[LINE] Downloaded audio file: ${fileName} ${media.mimeType} (${media.size} bytes)`);
-          return { text: `[media:audio filename="${fileName}" mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`, media };
+          const text = `[media:audio messageId=${message.id} filename="${fileName}" mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`;
+          storeMessage(message.id, text, userId ?? undefined);
+          return { text, media };
         } catch (err: any) {
           console.error(`[LINE] Audio file download failed (${fileName}):`, err);
           const limitMB = Math.round(MEDIA_LIMITS.audio / (1024 * 1024));
@@ -352,7 +457,9 @@ async function processMessage(event: MessageEvent): Promise<ProcessedMessage | n
         try {
           const media = await downloadLineMedia(message.id, config.channelAccessToken, MEDIA_LIMITS.video, "video/mp4");
           console.log(`[LINE] Downloaded video file: ${fileName} ${media.mimeType} (${media.size} bytes)`);
-          return { text: `[media:video filename="${fileName}" mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`, media };
+          const text = `[media:video messageId=${message.id} filename="${fileName}" mimeType=${media.mimeType} size=${Math.round(media.size/1024)}KB]`;
+          storeMessage(message.id, text, userId ?? undefined);
+          return { text, media };
         } catch (err: any) {
           console.error(`[LINE] Video file download failed (${fileName}):`, err);
           const limitMB = Math.round(MEDIA_LIMITS.video / (1024 * 1024));
@@ -360,6 +467,24 @@ async function processMessage(event: MessageEvent): Promise<ProcessedMessage | n
             return { text: `[SYSTEM: Video file "${fileName}" too large. Inform user: max ${limitMB}MB for video files]` };
           }
           return { text: `[User sent a video file: ${fileName} — download failed]` };
+        }
+      }
+
+      // PDF files → download and send inline to AI (Gemini / Claude read PDFs natively)
+      if (ext === "pdf") {
+        try {
+          const PDF_LIMIT = 20 * 1024 * 1024; // 20MB
+          const media = await downloadLineMedia(message.id, config.channelAccessToken, PDF_LIMIT, "application/pdf");
+          console.log(`[LINE] Downloaded PDF: ${fileName} (${media.size} bytes)`);
+          const text = `[media:document messageId=${message.id} filename="${fileName}" mimeType=application/pdf size=${Math.round(media.size / 1024)}KB]`;
+          storeMessage(message.id, text, userId ?? undefined);
+          return { text, media };
+        } catch (err: any) {
+          console.error(`[LINE] PDF download failed (${fileName}):`, err);
+          if (err?.message?.includes("MB limit")) {
+            return { text: `[SYSTEM: PDF "${fileName}" too large. Inform user: max 20MB for PDF files]` };
+          }
+          return { text: `[User sent a PDF file: ${fileName} — download failed]` };
         }
       }
 
@@ -542,9 +667,13 @@ async function flushQueue(userId: string): Promise<void> {
     if (result.audioUrl) {
       messages.push({ type: "audio", originalContentUrl: result.audioUrl, duration: result.audioDuration || 5000 });
     }
+    if (result.videoUrl) {
+      messages.push({ type: "video", originalContentUrl: result.videoUrl, previewImageUrl: result.videoUrl });
+    }
 
-    // ถ้ามี audio → ส่งแค่ audio ไม่ต้องส่ง text ซ้ำ (ยกเว้นมี image ด้วย)
-    if (!result.audioUrl) {
+    // ถ้ามี audio/video → ส่งแค่ media ไม่ต้องส่ง text ซ้ำ (ยกเว้นมี image ด้วย)
+    const hasMediaOnly = !!(result.audioUrl || result.videoUrl);
+    if (!hasMediaOnly) {
       const useQuote = hadPushInterrupt && !!latestQuoteToken;
       const chunks = splitReply(stripMarkdown(result.text));
       let firstText = true;
@@ -663,12 +792,71 @@ export async function handleWebhook(events: WebhookEvent[]): Promise<void> {
     if (isMediaMsg) q.mediaIncoming--;
     if (!processed) continue;
 
-    // 3rd+ consecutive media → auto-action ทำเลยไม่ถาม
+    // Media: 3rd+ consecutive → auto-action, otherwise → ask user first
     if (processed.media) {
       const mediaCount = trackMediaSend(userId);
+      const type: PendingMediaType = processed.text.includes("media:video") ? "video"
+        : processed.text.includes("media:audio") ? "audio"
+        : processed.text.includes("media:document") ? "document"
+        : "image";
+      const fnMatch = processed.text.match(/filename="([^"]+)"/);
+      const filename = fnMatch ? fnMatch[1] : undefined;
+
       if (mediaCount >= 3) {
+        // Auto-action: user is batch-sending files
+        storeRecentMedia(userId, processed.media, type, filename);
         processed.text = `[User sent media (consecutive file #${mediaCount}). Check conversation history — user has already told you what to do with previous media files. Apply the same action automatically without asking. If the pattern isn't clear, briefly describe what you perceive and ask.]`;
         console.log(`[LINE] ${userId}: auto-action mode (media #${mediaCount})`);
+        pendingMedia.delete(userId);
+      } else {
+        // Ask user what they want to do first — store ref only (no binary)
+        storePendingMedia(userId, processed.media, type, filename);
+        processed.text = buildMediaAskText(type, filename, Math.round(processed.media.size / 1024));
+        processed.media = undefined;
+        console.log(`[LINE] ${userId}: media pending (${type}), asking user`);
+      }
+    } else {
+      // Non-media: check pending first (user giving first instruction after ask)
+      const pending = pendingMedia.get(userId);
+      if (pending && Date.now() - pending.ts < PENDING_MEDIA_TTL) {
+        pendingMedia.delete(userId);
+        storeRecentMedia(userId, pending.media, pending.type, pending.filename); // warm cache
+        processed.media = pending.media;
+        const typeLabel = { image: "รูปภาพ", video: "วิดีโอ", audio: "เสียง", document: "PDF" }[pending.type];
+        const fileInfo = pending.filename ? ` "${pending.filename}"` : "";
+        processed.text = `[User sent ${typeLabel}${fileInfo} earlier. Now giving instruction. Media is attached. User says: "${processed.text}". Process accordingly.]`;
+        console.log(`[LINE] ${userId}: attached pending ${pending.type} to follow-up`);
+      } else {
+        // Follow-up question: memory cache first → DB + re-download fallback
+        const cached = recentMediaCache.get(userId);
+        if (cached && Date.now() - cached.ts < RECENT_MEDIA_TTL) {
+          // Memory hit — ใช้ binary ที่มีอยู่เลย
+          const typeLabel = { image: "รูปภาพ", video: "วิดีโอ", audio: "เสียง", document: "PDF" }[cached.type];
+          const fileInfo = cached.filename ? ` "${cached.filename}"` : "";
+          processed.media = cached.media;
+          processed.text = `[User sent ${typeLabel}${fileInfo} earlier and it was analyzed. Media re-attached from cache. User says: "${processed.text}". Re-analyze only if needed.]`;
+          console.log(`[LINE] ${userId}: cache hit — re-attached ${cached.type}`);
+        } else {
+          // Memory miss — query DB for messageId → re-download
+          const ref = getLastMediaMessage(userId);
+          if (ref) {
+            try {
+              const limitMap: Record<PendingMediaType, number> = {
+                image: MEDIA_LIMITS.image, video: MEDIA_LIMITS.video,
+                audio: MEDIA_LIMITS.audio, document: 20 * 1024 * 1024,
+              };
+              const redownloaded = await downloadLineMedia(ref.messageId, config.channelAccessToken, limitMap[ref.type], ref.mimeType);
+              storeRecentMedia(userId, redownloaded, ref.type, ref.filename); // warm cache
+              const typeLabel = { image: "รูปภาพ", video: "วิดีโอ", audio: "เสียง", document: "PDF" }[ref.type];
+              const fileInfo = ref.filename ? ` "${ref.filename}"` : "";
+              processed.media = redownloaded;
+              processed.text = `[User sent ${typeLabel}${fileInfo} earlier and it was analyzed. Re-downloaded for follow-up. User says: "${processed.text}". Re-analyze only if needed.]`;
+              console.log(`[LINE] ${userId}: cache miss — re-downloaded ${ref.type} (${ref.messageId})`);
+            } catch (err) {
+              console.warn(`[LINE] ${userId}: re-download failed (LINE media expired?):`, err);
+            }
+          }
+        }
       }
     }
 

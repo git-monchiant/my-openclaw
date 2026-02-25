@@ -15,13 +15,32 @@
  * Security: เฉพาะ owner userId เท่านั้น (ถ้ามี OWNER_USER_ID ใน env)
  */
 
+import fs from "fs";
+import path from "path";
 import type { ToolDefinition, ToolContext } from "./types.js";
 import { getDb } from "../memory/store.js";
 import { emitDashboardEvent } from "../admin/events.js";
 
-// ===== In-memory log buffer =====
-const LOG_BUFFER_SIZE = 500;
+// ===== In-memory log buffer (24hr rolling) =====
+const LOG_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+const LOG_BUFFER_CAP = 5000;                  // max entries in memory
+const LOG_FILE = path.join(process.env.DATA_DIR || "./data", "logs", "system.log");
+
 export const logBuffer: Array<{ ts: string; level: string; msg: string }> = [];
+
+function appendLogToFile(entry: { ts: string; level: string; msg: string }) {
+  fs.appendFile(LOG_FILE, JSON.stringify(entry) + "\n", () => {});
+}
+
+function trimLogBuffer() {
+  const cutoff = Date.now() - LOG_MAX_AGE_MS;
+  while (logBuffer.length > 0 && new Date(logBuffer[0].ts).getTime() < cutoff) {
+    logBuffer.shift();
+  }
+  if (logBuffer.length > LOG_BUFFER_CAP) {
+    logBuffer.splice(0, logBuffer.length - LOG_BUFFER_CAP);
+  }
+}
 
 // Override console.log/error to capture logs
 const origLog = console.log;
@@ -30,8 +49,10 @@ const origError = console.error;
 console.log = (...args: unknown[]) => {
   const msg = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
   const ts = new Date().toISOString();
-  logBuffer.push({ ts, level: "info", msg });
-  if (logBuffer.length > LOG_BUFFER_SIZE) logBuffer.shift();
+  const entry = { ts, level: "info", msg };
+  logBuffer.push(entry);
+  if (logBuffer.length > LOG_BUFFER_CAP + 200) trimLogBuffer();
+  appendLogToFile(entry);
   origLog.apply(console, args);
   emitDashboardEvent("log", { ts, level: "info", msg: msg.length > 500 ? msg.substring(0, 500) : msg });
 };
@@ -39,11 +60,42 @@ console.log = (...args: unknown[]) => {
 console.error = (...args: unknown[]) => {
   const msg = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
   const ts = new Date().toISOString();
-  logBuffer.push({ ts, level: "error", msg });
-  if (logBuffer.length > LOG_BUFFER_SIZE) logBuffer.shift();
+  const entry = { ts, level: "error", msg };
+  logBuffer.push(entry);
+  if (logBuffer.length > LOG_BUFFER_CAP + 200) trimLogBuffer();
+  appendLogToFile(entry);
   origError.apply(console, args);
   emitDashboardEvent("log", { ts, level: "error", msg: msg.length > 500 ? msg.substring(0, 500) : msg });
 };
+
+// Startup: create log dir + restore last 24hr from file into logBuffer
+(function initLogFile() {
+  try {
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    if (!fs.existsSync(LOG_FILE)) return;
+    const cutoff = Date.now() - LOG_MAX_AGE_MS;
+    const lines = fs.readFileSync(LOG_FILE, "utf8").split("\n").filter(Boolean);
+    for (const line of lines) {
+      try {
+        const e = JSON.parse(line) as { ts: string; level: string; msg: string };
+        if (new Date(e.ts).getTime() >= cutoff) logBuffer.push(e);
+      } catch { /* skip malformed */ }
+    }
+    origLog(`[log] Restored ${logBuffer.length} entries (last 24hr) from ${LOG_FILE}`);
+  } catch { /* first run */ }
+})();
+
+// Hourly: trim in-memory buffer + rewrite file to remove entries older than 24hr
+(function scheduleLogTrim() {
+  setTimeout(() => {
+    try {
+      trimLogBuffer();
+      const lines = logBuffer.map((l) => JSON.stringify(l)).join("\n");
+      fs.writeFileSync(LOG_FILE, lines + (lines ? "\n" : ""));
+    } catch { /* ignore */ }
+    scheduleLogTrim();
+  }, 60 * 60 * 1000).unref();
+})();
 
 // ===== Runtime config overrides =====
 export const configOverrides = new Map<string, string>();

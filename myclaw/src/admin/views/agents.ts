@@ -17,14 +17,16 @@ async function renderAgents(el){
 
   if(!_selectedAgent && agents.length) _selectedAgent = agents[0].id;
 
-  // Agent list items
-  const listItems = agents.map(a=>{
+
+  // Agent list items — exclude orchestrator/fallback
+  const listItems = agents.filter(a => a.type === 'agent').map(a=>{
     const sk = (a.skills||[]);
     const isActive = _selectedAgent === a.id;
+    const typeBadge = a.type==='orchestrator' ? badge('ORCHESTRATOR','orange') : a.type==='fallback' ? badge('FALLBACK','red') : '';
     return '<div class="agent-item'+(isActive?' active':'')+(a.enabled?'':' disabled')+'" onclick="selectAgent(\\''+esc(a.id)+'\\',event)"'+(a.enabled?'':' style="opacity:.5"')+'>'
       + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">'
         + '<div style="font-size:15px;font-weight:700;color:#fff;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(a.name)+'</div>'
-        + (a.isDefault ? badge('DEFAULT','green') : '')
+        + typeBadge
         + (a.enabled ? '' : badge('OFF','red'))
       + '</div>'
       + '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">'
@@ -32,20 +34,19 @@ async function renderAgents(el){
         + '<span style="font-size:11px;color:var(--text2)"><code style="font-size:10px">'+esc(a.model)+'</code></span>'
       + '</div>'
       + '<div style="font-size:11px;color:var(--text3)">'
-        + '<span>'+sk.length+' skills</span>'
+        + (a.type==='agent' ? '<span>'+sk.length+' skills</span>' : '<span style="color:rgba(255,140,0,.7)">'+(a.type==='orchestrator'?'active':'standby')+'</span>')
         + (a.description ? ' &middot; '+esc(a.description.length>40?a.description.substring(0,40)+'...':a.description) : '')
       + '</div>'
     + '</div>';
   }).join('');
 
-  const enabledCount = agents.filter(a=>a.enabled).length;
+  const enabledCount = agents.filter(a=>a.enabled && a.type==='agent').length;
 
   el.innerHTML = \`
     <div class="page-header">
-      <div class="page-title">Agents <span class="sub">\${agents.length} total &middot; \${enabledCount} active</span></div>
+      <div class="page-title">Agents <span class="sub">\${agents.filter(a=>a.type==='agent').length} agents &middot; \${enabledCount} active</span></div>
       <button class="btn btn-primary" onclick="showAddAgent()">+ New Agent</button>
     </div>
-
     <div class="agent-split">
       <!-- Left: Agent list -->
       <div class="agent-list">
@@ -84,6 +85,31 @@ async function renderAgents(el){
   if(_selectedAgent) renderAgentDetail(_selectedAgent);
 }
 
+async function addOrchTool(agentId, toolName){
+  const a = _cachedAgents.find(x=>x.id===agentId);
+  if(!a) return;
+  const current = a.allowedTools || [];
+  if(current.includes(toolName)) return;
+  const r = await api('/api/orchestrator','PATCH',{allowedTools:[...current, toolName]});
+  if(!r.error){ a.allowedTools = r.allowedTools; renderAgentDetail(agentId); showToast('Added '+toolName); }
+  else showToast('Error: '+r.error,'error');
+}
+
+async function removeOrchTool(agentId, toolName){
+  const a = _cachedAgents.find(x=>x.id===agentId);
+  if(!a) return;
+  const updated = (a.allowedTools||[]).filter(t=>t!==toolName);
+  const r = await api('/api/orchestrator','PATCH',{allowedTools:updated});
+  if(!r.error){ a.allowedTools = r.allowedTools; renderAgentDetail(agentId); showToast('Removed '+toolName); }
+  else showToast('Error: '+r.error,'error');
+}
+
+async function setActiveOrchestrator(id){
+  const r = await api('/api/orchestrator/active','POST',{id});
+  if(r.success){ showToast('Active orchestrator updated'); renderAgents(document.getElementById('tab-agents')); }
+  else showToast('Error: '+(r.error||'unknown'),'error');
+}
+
 function selectAgent(agentId, evt){
   if(evt && (evt.target.tagName==='BUTTON'||evt.target.tagName==='SELECT')) return;
   _selectedAgent = agentId;
@@ -95,7 +121,7 @@ function selectAgent(agentId, evt){
   renderAgentDetail(agentId);
 }
 
-function renderAgentDetail(agentId){
+async function renderAgentDetail(agentId){
   const a = _cachedAgents.find(x=>x.id===agentId);
   if(!a) return;
   const el = document.getElementById('agent-detail-content');
@@ -104,6 +130,53 @@ function renderAgentDetail(agentId){
   const pColor = (p)=> p==='gemini'?'blue':p==='openrouter'?'green':p==='ollama'?'purple':p==='anthropic'?'orange':p==='openai'?'teal':'red';
   const sk = (a.skills||[]);
   const assignedIds = new Set(sk.map(s=>s.id));
+
+  // Orchestrator: load tools from API then render
+  if(a.type === 'orchestrator' || a.type === 'fallback') {
+    const toolsData = await api('/api/tools');
+    const allToolNames = (toolsData.tools||[]).map(t=>t.name).sort();
+    const orchTools = a.allowedTools || [];
+    const orchToolSet = new Set(orchTools);
+
+    const toolBadges = orchTools.map(t=>
+      '<span class="b b-orange" style="font-size:10px;gap:3px">'+esc(t)
+      +' <span style="cursor:pointer;opacity:.5;margin-left:2px;font-size:13px;line-height:1" onclick="removeOrchTool(\\''+esc(a.id)+'\\',\\''+esc(t)+'\\')">&#x00D7;</span>'
+      +'</span>'
+    ).join(' ');
+
+    const unassignedTools = allToolNames.filter(t=>!orchToolSet.has(t));
+    const addToolHtml = '<select id="add-orch-tool" style="font-size:11px;padding:4px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);outline:none">'
+      + '<option value="">+ Add tool...</option>'
+      + unassignedTools.map(t=>'<option value="'+esc(t)+'">'+esc(t)+'</option>').join('')
+      + '</select>';
+
+    el.innerHTML =
+      '<div class="agent-detail-header">'
+        + '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">'
+          + '<div style="font-size:20px;font-weight:800;color:#fff;letter-spacing:-.3px">'+esc(a.name)+'</div>'
+          + (a.type==='orchestrator' ? badge('ORCHESTRATOR','orange') : badge('FALLBACK','red'))
+          + '<div style="margin-left:auto;display:flex;align-items:center;gap:6px">'
+            + badge(a.provider, pColor(a.provider))
+            + '<code style="font-size:11px">'+esc(a.model)+'</code>'
+            + '<span style="font-size:10px;color:var(--text3)">env key</span>'
+          + '</div>'
+        + '</div>'
+        + (a.description ? '<div style="font-size:12px;color:var(--text2);margin-bottom:12px;line-height:1.5">'+esc(a.description)+'</div>' : '')
+        // Tools
+        + '<div style="margin-bottom:14px">'
+          + '<div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px;font-weight:700">Tools <span style="font-weight:400;text-transform:none;letter-spacing:0">('+orchTools.length+')</span></div>'
+          + '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">'
+            + (toolBadges || '<span style="font-size:11px;color:var(--text3)">No tools</span>')
+            + ' ' + addToolHtml
+          + '</div>'
+        + '</div>'
+      + '</div>';
+
+    // Add tool listener
+    const sel = document.getElementById('add-orch-tool');
+    if(sel) sel.onchange = function(){ if(this.value) addOrchTool(a.id, this.value); };
+    return;
+  }
 
   // Skill badges with remove
   const skillBadges = sk.map(s=>
@@ -127,11 +200,29 @@ function renderAgentDetail(agentId){
     '<div class="agent-detail-header">'
       + '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">'
         + '<div style="font-size:20px;font-weight:800;color:#fff;letter-spacing:-.3px">'+esc(a.name)+'</div>'
-        + (a.isDefault ? badge('DEFAULT','green') : '')
+        + (a.type==='orchestrator' ? badge('ORCHESTRATOR','orange') : a.type==='fallback' ? badge('FALLBACK','red') : '')
         + (a.enabled ? '' : badge('DISABLED','red'))
-        + '<div style="margin-left:auto;display:flex;align-items:center;gap:6px">'
-          + badge(a.provider, pColor(a.provider))
-          + '<code style="font-size:11px">'+esc(a.model)+'</code>'
+        + '<div style="margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:5px">'
+          + '<div style="display:flex;align-items:center;gap:6px">'
+            + badge(a.provider, pColor(a.provider))
+            + '<span id="model-disp-'+esc(a.id)+'" style="display:flex;align-items:center;gap:4px">'
+              + '<code style="font-size:11px">'+esc(a.model)+'</code>'
+              + '<span style="font-size:12px;cursor:pointer;opacity:.3" onclick="startEditModel(\\''+esc(a.id)+'\\',\\''+esc(a.model)+'\\')">&#x270F;</span>'
+            + '</span>'
+            + '<span id="model-edit-'+esc(a.id)+'" style="display:none;align-items:center;gap:4px">'
+              + '<input id="model-inp-'+esc(a.id)+'" value="'+esc(a.model)+'" style="font-size:11px;padding:3px 8px;width:190px;border:1px solid var(--accent);border-radius:6px;background:var(--bg);color:var(--text);outline:none" onkeydown="if(event.key===\\'Enter\\')saveAgentModel(\\''+esc(a.id)+'\\');if(event.key===\\'Escape\\')cancelEditModel(\\''+esc(a.id)+'\\')">'
+              + '<button class="btn btn-primary" style="font-size:10px;padding:3px 8px" onclick="saveAgentModel(\\''+esc(a.id)+'\\')">Save</button>'
+              + '<button class="btn" style="font-size:10px;padding:3px 6px" onclick="cancelEditModel(\\''+esc(a.id)+'\\')">&#x2715;</button>'
+            + '</span>'
+          + '</div>'
+          + (a.provider==='openrouter'
+            ? '<div style="display:flex;gap:3px;flex-wrap:wrap;justify-content:flex-end">'
+              + [['moonshotai/kimi-k2.5','Kimi K2.5'],['minimax/minimax-m2.5','MiniMax M2.5'],['google/gemini-2.5-flash','Gemini Flash'],['deepseek/deepseek-r1','DeepSeek R1']].map(function(p){
+                  var active = a.model===p[0];
+                  return '<button class="btn" style="font-size:9px;padding:2px 7px;'+(active?'border-color:var(--accent);color:var(--accent)':'opacity:.55')+'" onclick="quickSwitchModel(\\''+esc(a.id)+'\\',\\''+p[0]+'\\')">'+p[1]+'</button>';
+                }).join('')
+              + '</div>'
+            : '')
         + '</div>'
       + '</div>'
       + (a.description ? '<div style="font-size:12px;color:var(--text2);margin-bottom:12px;line-height:1.5">'+esc(a.description)+'</div>' : '')
@@ -148,8 +239,7 @@ function renderAgentDetail(agentId){
         + '<label class="tog"><input type="checkbox" '+(a.enabled?'checked':'')+' onchange="toggleAgent(\\''+esc(a.id)+'\\',this.checked)"><span class="sl"></span></label>'
         + '<span style="font-size:12px;font-weight:600;color:'+(a.enabled?'var(--green)':'var(--red)')+'">'+( a.enabled?'Enabled':'Disabled')+'</span>'
         + '<div style="margin-left:auto;display:flex;gap:8px">'
-          + (!a.isDefault ? '<button class="btn" onclick="setDefaultAgent(\\''+esc(a.id)+'\\')">Set Default</button>' : '')
-          + (!a.isDefault ? '<button class="btn btn-red" onclick="deleteAgentConfirm(\\''+esc(a.id)+'\\',\\''+esc(a.name)+'\\')">Delete</button>' : '')
+          + (a.type==='agent' ? '<button class="btn btn-red" onclick="deleteAgentConfirm(\\''+esc(a.id)+'\\',\\''+esc(a.name)+'\\')">Delete</button>' : '')
         + '</div>'
       + '</div>'
     + '</div>'
@@ -222,6 +312,36 @@ async function deleteAgentConfirm(id,name){
 async function removeAgentSkill(agentId,skillId){
   try{
     await apiDelete('/api/agents/'+agentId+'/skills/'+skillId);
+    loadTab('agents');
+  }catch(e){alert('Error: '+e.message)}
+}
+
+// ===== Model inline edit =====
+function startEditModel(agentId, currentModel){
+  document.getElementById('model-disp-'+agentId).style.display='none';
+  var ed = document.getElementById('model-edit-'+agentId);
+  ed.style.display='flex';
+  var inp = document.getElementById('model-inp-'+agentId);
+  inp.value = currentModel;
+  inp.focus(); inp.select();
+}
+function cancelEditModel(agentId){
+  document.getElementById('model-edit-'+agentId).style.display='none';
+  document.getElementById('model-disp-'+agentId).style.display='flex';
+}
+async function saveAgentModel(agentId){
+  var model = document.getElementById('model-inp-'+agentId).value.trim();
+  if(!model) return;
+  try{
+    const r = await api('/api/agents/'+agentId, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model})});
+    if(r.error){alert('Error: '+(r.message||r.error));return}
+    loadTab('agents');
+  }catch(e){alert('Error: '+e.message)}
+}
+async function quickSwitchModel(agentId, model){
+  try{
+    const r = await api('/api/agents/'+agentId, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model})});
+    if(r.error){alert('Error: '+(r.message||r.error));return}
     loadTab('agents');
   }catch(e){alert('Error: '+e.message)}
 }

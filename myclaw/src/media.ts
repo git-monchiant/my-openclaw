@@ -82,5 +82,8 @@ export function detectContentType(buffer: Buffer): string {
   if (buffer[0] === 0x00 && buffer[1] === 0x00 && buffer[2] === 0x00 &&
       buffer[4] === 0x66 && buffer[5] === 0x74 && buffer[6] === 0x79 && buffer[7] === 0x70) return "audio/mp4";
 
+  // PDF: %PDF (0x25 0x50 0x44 0x46)
+  if (buffer[0] === 0x25 && buffer[1] === 0x50 && buffer[2] === 0x44 && buffer[3] === 0x46) return "application/pdf";
+
   return "application/octet-stream";
 }

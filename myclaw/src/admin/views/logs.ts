@@ -8,7 +8,7 @@ let logSearch = '';
 let logAutoScroll = true;
 
 async function renderLogs(el, isRefresh){
-  const d = await api('/api/logs?level='+logLevel+'&limit=300&search='+encodeURIComponent(logSearch));
+  const d = await api('/api/logs?level='+logLevel+'&limit=1000&search='+encodeURIComponent(logSearch));
   const logs = d.logs.slice().reverse();
   const rows = logs.map(l=>logRowHtml(l)).join('');
 

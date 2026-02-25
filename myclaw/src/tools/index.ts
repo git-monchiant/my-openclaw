@@ -29,6 +29,8 @@ import { googleLinkTool } from "./google-link.js";
 import { placesTool } from "./places.js";
 import { webappTool } from "./webapp.js";
 import { userProfileTool } from "./user-profile.js";
+import { todoTool } from "./todo.js";
+import { expenseTool } from "./expense.js";
 
 /**
  * Tool Registry
@@ -69,6 +71,8 @@ const allTools: ToolDefinition[] = [
   placesTool,
   webappTool,
   userProfileTool,
+  todoTool,
+  expenseTool,
 ];
 
 // Initialize cron jobs from DB on startup

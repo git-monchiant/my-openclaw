@@ -24,8 +24,9 @@ import { getQueueStats } from "../line.js";
 import { getAllLinkedUsers } from "../google/store.js";
 import { getProviderInfo } from "../ai.js";
 import {
-  listAgentsWithSkills, getAgent, createAgent, updateAgent, deleteAgent,
-  setDefaultAgent, listSkills, assignSkill, removeSkill, getAgentLogs,
+  listAgentsWithSkills, listAgents, getAgent, getOrchestratorAgent, setActiveOrchestrator,
+  createAgent, updateAgent, deleteAgent,
+  listSkills, assignSkill, removeSkill, getAgentLogs,
 } from "../agents/registry.js";
 
 const router = Router();
@@ -143,7 +144,7 @@ router.get("/api/status", (_req, res) => {
 
 // ===== GET /api/logs =====
 router.get("/api/logs", (req, res) => {
-  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200));
+  const limit = Math.min(2000, Math.max(1, Number(req.query.limit) || 500));
   const level = (req.query.level as string) || "all";
   const search = (req.query.search as string) || "";
 
@@ -557,10 +558,46 @@ router.post("/api/provider", (req, res) => {
   res.json({ success: true, ...updated });
 });
 
+// ===== GET /api/orchestrator =====
+router.get("/api/orchestrator", (_req, res) => {
+  try {
+    res.json(getOrchestratorAgent(getDataDir()));
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ===== PATCH /api/orchestrator =====
+router.patch("/api/orchestrator", (req, res) => {
+  const orch = getOrchestratorAgent(getDataDir());
+  const { name, model, systemPrompt, allowedTools } = req.body || {};
+  const result = updateAgent(getDataDir(), orch.id, {
+    ...(name !== undefined && { name }),
+    ...(model !== undefined && { model }),
+    ...(systemPrompt !== undefined && { systemPrompt: systemPrompt || null }),
+    ...(allowedTools !== undefined && { allowedTools: Array.isArray(allowedTools) ? allowedTools : null }),
+  });
+  if (!result) { res.status(404).json({ error: "not_found" }); return; }
+  res.json(result);
+});
+
+// ===== POST /api/orchestrator/active =====
+router.post("/api/orchestrator/active", (req, res) => {
+  const { id } = req.body || {};
+  if (!id) { res.status(400).json({ error: "id required" }); return; }
+  const result = setActiveOrchestrator(getDataDir(), id);
+  if (!result) { res.status(404).json({ error: "not_found" }); return; }
+  res.json({ success: true, active: result });
+});
+
 // ===== GET /api/agents =====
 router.get("/api/agents", (_req, res) => {
   try {
-    const agents = listAgentsWithSkills(getDataDir());
+    // ส่ง orchestrator/fallback มาด้วย เพื่อ admin จะได้ render ครบ
+    const allAgents = listAgents(getDataDir());
+    const agentSkillsMap = listAgentsWithSkills(getDataDir()); // only type='agent', has skills
+    const skillsById = new Map(agentSkillsMap.map((a) => [a.id, a.skills]));
+    const agents = allAgents.map((a) => ({ ...a, skills: skillsById.get(a.id) || [] }));
     res.json({ total: agents.length, agents });
   } catch (err: any) {
     res.json({ total: 0, agents: [], error: err?.message });
@@ -603,14 +640,11 @@ router.delete("/api/agents/:id", (req, res) => {
   res.json({ success: true });
 });
 
-// ===== POST /api/agents/:id/default =====
-router.post("/api/agents/:id/default", (req, res) => {
-  const result = setDefaultAgent(getDataDir(), req.params.id);
-  if (!result) {
-    res.status(404).json({ error: "not_found" });
-    return;
-  }
-  res.json({ success: true, agent: result });
+
+// ===== GET /api/tools =====
+router.get("/api/tools", (_req, res) => {
+  const tools = getToolDefinitions().map((t) => ({ name: t.name, description: t.description }));
+  res.json({ tools });
 });
 
 // ===== GET /api/skills =====

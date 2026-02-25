@@ -10,9 +10,29 @@ import {
   formatMemoryForPrompt,
   DEFAULT_MEMORY_CONFIG,
 } from "./memory/index.js";
-import { getActiveAgent, getAgent, getAgentSkills, listSkills, listAgentsWithSkills, logAgentActivity } from "./agents/registry.js";
+import { getActiveAgent, getAgent, getOrchestratorAgent, getAgentSkills, listAgentsWithSkills, logAgentActivity } from "./agents/registry.js";
 import type { AgentConfig, SkillConfig } from "./agents/types.js";
 import { startTask, updateTask } from "./admin/active-tasks.js";
+
+// Orchestrator-only synthetic tool — NOT in global registry
+// Gemini ต้อง call respond_directly หรือ tool อื่นเสมอ (tool_config.mode=ANY) — ตอบ text-only ไม่ได้
+const RESPOND_DIRECTLY_TOOL = {
+  name: "respond_directly",
+  description:
+    "Use this to send a direct text reply to the user. " +
+    "Call this for: greetings, simple conversation, math calculations, " +
+    "follow-up questions whose answers are already in the conversation, " +
+    "and after receiving a delegate_task result to relay the answer. " +
+    "Do NOT call this if the user's request requires action (search, create, schedule, etc.) — " +
+    "call the appropriate tool instead.",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      text: { type: "string", description: "The exact reply text to send to the user." },
+    },
+    required: ["text"],
+  },
+};
 
 /** ตรวจ media ที่ต้องจัดการพิเศษ (video/audio — เฉพาะ Gemini process inline ได้, tools ต้องปิด) */
 function isHeavyMedia(media?: MediaData): boolean {
@@ -24,6 +44,7 @@ interface ChatState {
   toolCallCount: number;
   lastAudioResult?: AudioResult;
   lastImageUrl?: string;
+  lastVideoUrl?: string;
 }
 
 // ===== Provider detection (dynamic — เปลี่ยนได้จาก admin) =====
@@ -133,7 +154,7 @@ FORMATTING: You are on LINE chat — it does NOT support markdown. NEVER use mar
 Keep it clean and easy to read on a phone screen.
 You can receive and understand images, audio messages, videos, stickers, locations, and files that users send.
 You have built-in multimodal capabilities: you can SEE images/videos and HEAR audio directly — this does NOT require any tools. When you receive media inline, analyze it immediately.
-When analyzing video/audio: transcribe and describe what you can actually see and hear. Do NOT fabricate content that isn't there.
+When analyzing audio: transcribe what you hear. When analyzing video: visually describe what you see (scenes, people, actions, objects, any text on screen). Do NOT fabricate content — only describe what is actually there.
 When the user refers to relative dates ("yesterday", "last night", "เมื่อคืน"), always use the current date above to determine the exact date before searching.
 
 Key capabilities:
@@ -142,7 +163,9 @@ Key capabilities:
 - You can search the web (web_search), fetch web pages (web_fetch), analyze images (image), send images (message push_image), generate speech (tts), and control a browser (browser).
 
 Follow-up about previous media:
-When the user refers to media from a PREVIOUS message (e.g. "read it again", "that's wrong, look at the image again", "ไปอ่านใหม่"), do NOT delegate to an agent — the agent won't have the old media. Instead, look at your conversation history: you have the previous analysis/transcript from delegate_task results. Use that context to re-answer, correct your response, or provide more detail. Only delegate when the user sends NEW media in the current message.
+When the user refers to media from a PREVIOUS message (e.g. "read it again", "นกสีอะไร", "ไปอ่านใหม่"):
+- If you receive a re-analysis task WITH media attached (re-fetched inline) → analyze it fresh and answer the specific question directly. Ignore the previous analysis — do a full fresh analysis focused on what was asked.
+- If you only have conversation history (no inline media) → use the previous analysis/transcript from history to answer. If the answer isn't there, say so honestly.
 
 Searching:
 Before searching, THINK about what the user actually wants. Build a precise search query — vague queries give bad results.
@@ -174,7 +197,7 @@ Do NOT ask the user for technical details — just send the reconfigure link.`;
 }
 
 /** สร้าง system prompt สำหรับ orchestrator — มีรายชื่อ agents + skills ทั้งหมด */
-function getOrchestratorPrompt(allAgents: AgentConfig[]): string {
+function getOrchestratorPrompt(allAgents: AgentConfig[], orchestratorName = "MyClaw"): string {
   const dateObj = new Date();
   const now = dateObj.toLocaleString("en-GB", {
     timeZone: "Asia/Bangkok",
@@ -190,16 +213,26 @@ function getOrchestratorPrompt(allAgents: AgentConfig[]): string {
 
   const enabledAgents = allAgents.filter((a) => a.enabled);
 
-  const agentCatalog = enabledAgents
-    .map((a) => {
-      const skills = (a.skills || [])
-        .map((s) => `  - ${s.name} (skill_id: ${s.id}): ${s.description}`)
-        .join("\n");
-      return `Agent "${a.name}" (id: ${a.id}, provider: ${a.provider}/${a.model}):\n${skills || "  (no skills)"}`;
+  // Build skill → agents map (skill-first view for orchestrator decision making)
+  type SkillEntry = { name: string; description: string; agents: Array<{ name: string; id: string }> };
+  const skillMap = new Map<string, SkillEntry>();
+  for (const agent of enabledAgents) {
+    for (const skill of (agent.skills || [])) {
+      if (!skillMap.has(skill.id)) {
+        skillMap.set(skill.id, { name: skill.name, description: skill.description, agents: [] });
+      }
+      skillMap.get(skill.id)!.agents.push({ name: agent.name, id: agent.id });
+    }
+  }
+
+  const agentCatalog = [...skillMap.values()]
+    .map(({ name, description, agents }) => {
+      const agentList = agents.map((a) => `"${a.name}" (agentId: "${a.id}")`).join(", ");
+      return `SKILL: ${name}\n  WHAT: ${description}\n  DELEGATE TO: ${agentList}`;
     })
     .join("\n\n");
 
-  return `You are MyClaw, a helpful AI assistant orchestrator on LINE.
+  return `You are ${orchestratorName}, a helpful AI assistant orchestrator on LINE.
 Current date/time: ${now} (Asia/Bangkok)
 Year: ${ceYear} CE = พ.ศ. ${beYear}
 IMPORTANT: Always reply in the SAME language the user writes in. If the user writes in Thai, reply in Thai only.
@@ -212,20 +245,29 @@ Keep it clean and easy to read on a phone screen.
 
 You are the ORCHESTRATOR. You read, understand, plan, and coordinate specialist agents.
 
+=== MANDATORY TOOL RULE ===
+You MUST always call a tool. NEVER output raw text. Every response must be one of:
+  - respond_directly(text="...") — for direct replies (greetings, calculations, relaying results, errors)
+  - delegate_task(agentId="...", task="...") — when the request needs a specialist agent
+  - cron / memory_search / user_profile / etc. — for their specific purposes
+
 === YOUR RESPONSIBILITIES ===
 1. READ & UNDERSTAND: Analyze what the user wants — simple chat? a task? multi-step work?
-2. RESPOND DIRECTLY for greetings, simple conversation, and follow-up questions about previous results.
+2. RESPOND DIRECTLY (call respond_directly) for:
+   - Greetings, simple conversation, math calculations
+   - Follow-up questions whose answers are already in the conversation history
+   - Relaying a result from a completed delegate_task back to the user
    - ALWAYS check memory context below first for personal info (name, preferences, past topics).
-3. DELEGATE for tasks that need specialist tools:
-   - SIMPLE task (search, weather, news, one action) → delegate ONCE → got result → RESPOND IMMEDIATELY.
+3. DELEGATE (call delegate_task) for tasks that need specialist tools:
+   - SIMPLE task (search, weather, news, one action) → delegate ONCE → got result → respond_directly IMMEDIATELY.
    - MULTI-STEP task (fetch then create, search then TTS, etc.) → delegate step by step, read each result.
-4. If NO agent has the required capability: tell the user honestly and suggest what IS possible.
+4. If NO agent has the required capability: respond_directly with an honest explanation.
 
 === MOST IMPORTANT RULE ===
-When delegate_task returns a result that answers the user's question — RESPOND TO THE USER IMMEDIATELY.
+When delegate_task returns a result that answers the user's question — call respond_directly IMMEDIATELY.
 Do NOT delegate again for the same thing. Do NOT try to "get more details" or "verify" or "search again".
-The first successful result is the answer. Summarize it and reply. DONE.
-EXCEPTION: If the result is an error or empty/useless — you MAY retry once with a different query or different agent.
+The first successful result is the answer. Summarize it and call respond_directly. DONE.
+EXCEPTION: If the result is an error or empty/useless — you MAY retry once with a different query or different agent, then respond_directly.
 
 === SIMPLE vs MULTI-STEP ===
 SIMPLE (1 delegation): weather, news, search, scores, prices, single creation, single lookup
@@ -235,18 +277,35 @@ MULTI-STEP (2+ delegations): only when the user's request CLEARLY needs DIFFEREN
   "อ่าน mail ให้ฟัง" → email skill + TTS skill (2 different skills)
   "หาข่าวแล้วสร้างรูป" → web_research + image_creation (2 different skills)
   "หาร้านแล้วจองใน calendar" → places + calendar_mgmt (2 different skills)
-
 KEY: Multi-step means DIFFERENT agents/skills for DIFFERENT sub-tasks. Calling the SAME agent twice for the same question is WRONG.
+
+AUDIO/VIDEO DEFAULT TASK (user sends media without specific instruction):
+  AUDIO sent → delegate task: "Transcribe this audio message and summarize key points"
+  VIDEO sent → delegate task: "Analyze this video: describe what is shown (scenes, people, actions, objects, any text) and summarize the key content"
+
+COMBINED REQUEST in ONE delegation:
+  Audio: "ถอดเสียงแล้วสรุป" / "สรุปเสียงนี้" → task: "transcribe fully AND summarize the key points"
+  Video: "วิเคราะห์แล้วสรุป" / "สรุปวิดีโอ" → task: "analyze this video fully AND summarize the key content"
+  The agent receives media inline — handle everything in one pass, no need for 2 delegations.
 
 === CRITICAL RULES ===
 - FACTS & NEWS: For ANY question about facts, news, current events, sports, weather, prices — ALWAYS delegate to an agent with web_search. NEVER answer from your own knowledge — your training data is outdated.
 - MEMORY: For questions about the user (name, preferences, past conversations) — ALWAYS check memory context AND use memory_search/memory_get tools before responding. NEVER say "I don't know" without searching first.
 - SCHEDULING: When the user says "อีก X นาที", "เดี๋ยว", "ตอน X โมง", or ANY delayed request — call the cron tool RIGHT NOW. NEVER just promise in text.
 - CALENDAR: For ANY calendar request, delegate to an agent with calendar_mgmt skill. The google_link tool ONLY handles OAuth linking.
-- SEARCH/CREATE: When the user asks to search, find, create, build, or generate anything — call delegate_task RIGHT NOW. NEVER just say "I'll do it" as text.
+- QUESTION vs COMMAND: "เราสามารถ...ได้ไหม", "มีทางทำ...ได้มั้ย", "เป็นไปได้ไหม", "ทำได้มั้ย", "Can we...?", "Is it possible to...?" = user is ASKING if something is possible → respond_directly with a conversational answer (yes/no + brief explanation + ask if they want to proceed). Do NOT delegate immediately.
+- SEARCH/CREATE: Only when user gives a direct ACTION command ("สร้าง", "ทำ", "ช่วยทำ", "เขียน", "หา", "generate", "build", "create") without question form — call delegate_task RIGHT NOW. NEVER just say "I'll do it" as text.
 - RETRY: "ทำต่อ", "ลองอีกที", "ทำใหม่" = retry the previous creation task. Delegate immediately.
-- TTS: "ให้ฟัง", "อ่านให้ฟัง", "พูดให้ฟัง" = the user wants AUDIO, not text. If data must be fetched first, plan multi-step: fetch → TTS. If text is already available, delegate to TTS agent directly.
-- NO PROMISES: Never say "I'll search for you" or "Let me create..." as text — that does NOTHING. Always call the actual tool.
+- TTS: ONLY when the user gives a COMMAND to produce audio. TTS commands: "ให้ฟัง", "อ่านให้ฟัง", "พูดให้ฟัง", "อ่านออกเสียง", "ออกเสียงให้ฉัน/ให้ผม/ให้หน่อย". If data must be fetched first, plan multi-step: fetch → TTS. If text is already available, delegate to TTS agent directly.
+  NOT TTS — return TEXT instead: "ออกเสียงยังไง", "ออกเสียงอย่างไร", "ออกเสียงว่าอะไร" (questions about pronunciation → explain in text). "อ่านเอกสาร", "อ่านรูป", "อ่านไฟล์", "อ่านข้อความ" (user wants TEXT extraction/OCR).
+- CALCULATE: Math, percentages, unit conversions (km↔miles, °C↔°F, THB↔USD, kg↔lbs) — answer DIRECTLY without delegating. You can compute these natively. Only delegate if the user needs real-time exchange rates (use web_search).
+- OCR / TEXT FROM IMAGE: "อ่านตัวอักษร", "อ่านข้อความในรูป", "สแกนใบเสร็จ", "อ่านป้าย", "OCR" + image → delegate to agent with ocr/image_analysis skill. Do NOT try to read image text yourself as orchestrator.
+- TODO: "เพิ่มงาน", "รายการงาน", "to-do", "สิ่งที่ต้องทำ", "จดไว้ว่าต้องทำ" → delegate to agent with todo skill.
+- EXPENSE/INCOME: "บันทึกค่าใช้จ่าย", "จ่ายไปกี่บาท", "รายจ่าย", "รายได้" → delegate to agent with expense skill.
+- HEALTH: "บันทึกน้ำหนัก", "วันนี้วิ่ง", "นอนกี่ชั่วโมง", "แคล" → delegate to agent with health skill.
+- NEWS DIGEST / DAILY SUMMARY: "สรุปข่าวทุกเช้า", "ส่งข่าวให้ทุกวัน" → use cron tool with taskType="ai", the cron AI will search + push to user automatically.
+- STOCK/CRYPTO: "ราคาหุ้น", "ราคาคริปโต", "BTC", "SET index" → delegate to web_search agent for real-time prices.
+- NO PROMISES: Never use respond_directly to say "I'll search for you" or "Let me create..." — call the actual tool (delegate_task, cron, etc.) instead. Only call respond_directly when you have a real answer to give.
 - NO TOOLS YOU DON'T HAVE: If you don't have the right tool, delegate or tell the user honestly.
 
 === USER PROFILE ===
@@ -271,13 +330,25 @@ Always complete the user's main request FIRST, then save profile if applicable.
 - Item references ("อันแรก", "ฉบับที่ 2") → use data from the MOST RECENT result in conversation
 
 === FOLLOW-UP ABOUT PREVIOUS MEDIA ===
-When user asks about media from a PREVIOUS message (e.g. "ข้อ 5 ละ", "สรุปให้หน่อย"), do NOT delegate — use the content from your conversation history. Only delegate for NEW media.
+When user asks about media from a PREVIOUS message (e.g. "ข้อ 5 ละ", "สรุปให้หน่อย", "นกสีอะไร"):
+1. CHECK conversation history — find the previous analysis entry [Video messageId=XXX: ...] or [Image messageId=XXX: ...]
+2. If the answer IS already in the history → respond DIRECTLY without delegating
+3. If the answer is NOT in the history (e.g. asked about a detail the first analysis didn't cover):
+   - Extract the messageId from the history entry
+   - Call delegate_task with mediaMessageId="XXX" to re-fetch and re-analyze for the specific question
+   - Example: user asks "นกสีอะไร" → history shows [Video messageId=12345: ...no color mentioned...] → delegate_task(agentId=..., task="Re-analyze this video: what color is the bird?", mediaMessageId="12345")
 EXCEPTION: "อ่านให้ฟัง" = TTS request. Plan multi-step if data must be fetched first.
 
 === GOOGLE ACCOUNT LINKING ===
 When agent returns "google_not_linked", use google_link tool to generate a linking URL.
 
-=== AVAILABLE AGENTS ===
+=== HOW TO DELEGATE ===
+Step 1: Identify what SKILL the user's request needs.
+Step 2: Find the skill below → read "DELEGATE TO" to get the agentId.
+Step 3a: If the request needs action → Call delegate_task(agentId="...", task="...") immediately.
+Step 3b: If no tool action needed → Call respond_directly(text="...") immediately.
+Never output raw text — always call a tool.
+
 ${agentCatalog}`;
 }
 
@@ -294,6 +365,7 @@ export interface ChatResult {
   audioUrl?: string;
   audioDuration?: number;
   imageUrl?: string;
+  videoUrl?: string;
 }
 
 // Audio result จาก TTS tool (set ระหว่าง agent loop, อ่านหลัง loop จบ)
@@ -310,6 +382,10 @@ function checkToolResultForMedia(result: string, state: ChatState): void {
     if (parsed.imageUrl && parsed.success) {
       state.lastImageUrl = parsed.imageUrl;
       console.log(`[AI] Image detected: ${parsed.imageUrl}`);
+    }
+    if (parsed.videoUrl && parsed.success) {
+      state.lastVideoUrl = parsed.videoUrl;
+      console.log(`[AI] Video detected: ${parsed.videoUrl}`);
     }
   } catch { /* not JSON, ignore */ }
 }
@@ -360,20 +436,21 @@ export async function chat(userId: string, message: string, media?: MediaData, o
       console.log(`[AI] Delegate mode → agent "${activeAgent.name}" | Tools: ${filteredTools.length}`);
 
     } else if (isOrchestratorMode) {
-      // โหมด orchestrator: มีแค่ delegate_task + utility tools
-      activeAgent = getActiveAgent(memoryConfig.dataDir);
-      agentSkills = getAgentSkills(memoryConfig.dataDir, activeAgent.id);
+      // โหมด orchestrator: ไม่ผูกกับ agent ใดๆ — ใช้ Gemini env key เสมอ
+      // activeAgent = undefined (ไม่โหลด DEFAULT agent)
 
-      // Orchestrator = pure coordinator: delegate + memory + utility + cron
-      // TTS, Google tools, webapp ฯลฯ → delegate ให้ agent เฉพาะทาง
-      const orchestratorToolNames = new Set(["delegate_task", "get_datetime", "memory_search", "memory_get", "google_link", "cron", "user_profile"]);
-      filteredTools = getToolDefinitions().filter((t) => orchestratorToolNames.has(t.name));
+      // โหลด orchestrator config จาก DB (id='00') — ชื่อ, system prompt, allowed tools
+      const orchConfig = getOrchestratorAgent(memoryConfig.dataDir);
 
-      // สร้าง orchestrator prompt พร้อม agent catalog
+      // Tools: อ่านจาก DB ถ้ามี, fallback เป็น default set
+      const defaultOrchestratorTools = ["delegate_task", "get_datetime", "memory_search", "memory_get", "google_link", "cron", "user_profile"];
+      const orchestratorToolNames = new Set(orchConfig.allowedTools ?? defaultOrchestratorTools);
+      filteredTools = [...getToolDefinitions().filter((t) => orchestratorToolNames.has(t.name)), RESPOND_DIRECTLY_TOOL];
       const allAgents = listAgentsWithSkills(memoryConfig.dataDir);
-      orchestratorSystemPrompt = getOrchestratorPrompt(allAgents);
+      // ถ้ามี custom system_prompt ใน DB → ใช้เลย, ไม่งั้น → auto-generate
+      orchestratorSystemPrompt = orchConfig.systemPrompt || getOrchestratorPrompt(allAgents, orchConfig.name);
 
-      console.log(`[AI] Orchestrator mode | Agents: ${allAgents.filter((a) => a.enabled).length} | Tools: ${filteredTools.length}`);
+      console.log(`[AI] Orchestrator "${orchConfig.name}" | Agents: ${allAgents.filter((a) => a.enabled).length} | Tools: ${filteredTools.length}`);
 
     } else {
       // โหมด legacy (cron/spawn): เหมือนเดิม — ใช้ tools ทั้งหมดของ agent
@@ -400,9 +477,18 @@ export async function chat(userId: string, message: string, media?: MediaData, o
     startTask(userId, isOrchestratorMode ? "orchestrator" : (activeAgent?.id || "default"), message.substring(0, 80));
   }
 
-  // เลือก provider: delegate mode → ใช้ของ agent (ถ้า ready หรือมี per-agent key), ไม่งั้น → primary
+  // เลือก provider:
+  // - Orchestrator: ใช้ Gemini จาก env GEMINI_API_KEY เสมอ (ไม่ผ่าน agent ใดๆ)
+  // - Delegate (agent): ใช้ provider ของ agent นั้นๆ (ส่วนใหญ่เป็น OpenRouter)
   let provider = primaryProvider;
-  if (isDelegate && activeAgent) {
+  if (isOrchestratorMode) {
+    // Orchestrator always uses Gemini from env — ไม่ผ่าน agent ใดๆ
+    provider = "gemini";
+    if (!getGeminiKey()) {
+      return { text: "กรุณาตั้งค่า GEMINI_API_KEY ใน .env สำหรับ orchestrator" };
+    }
+    console.log(`[AI] Orchestrator using Gemini (env key)`);
+  } else if (isDelegate && activeAgent) {
     const agentProvider = activeAgent.provider;
     // Agent มี API key ของตัวเอง → ถือว่า ready เสมอ
     const hasOwnKey = !!activeAgent.apiKey;
@@ -474,13 +560,17 @@ export async function chat(userId: string, message: string, media?: MediaData, o
 
   if (provider === "gemini") {
     try {
-      const agentApiKey = activeAgent?.apiKey || undefined;
+      // Orchestrator ใช้ env key เสมอ — ห้าม pass per-agent key
+      const agentApiKey = isDelegate ? (activeAgent?.apiKey || undefined) : undefined;
       const trackingAgentId = isDelegate ? activeAgent?.id : "orchestrator";
       // Orchestrator mode: ไม่ส่ง media inline → บังคับให้ delegate ไปให้ agent ที่มี skill
       // media เก็บใน contextMedia (param 7) → delegate_task forward ให้ agent ได้
       // Agent (isDelegate): ส่ง media inline ปกติ → วิเคราะห์ตรง
       const inlineMedia = (isOrchestratorMode && !isDelegate && media) ? undefined : media;
-      reply = await chatGemini(message, dbHistory, fullSystemPrompt, userId, inlineMedia, filteredTools, media, trackingAgentId, agentApiKey, state);
+      // Orchestrator: force tool call (mode=ANY) — ต้อง call respond_directly หรือ tool อื่นเสมอ
+      // Agent (isDelegate): ไม่บังคับ — ตอบ text ตรงได้
+      const forceOrchestrator = isOrchestratorMode && !isDelegate;
+      reply = await chatGemini(message, dbHistory, fullSystemPrompt, userId, inlineMedia, filteredTools, media, trackingAgentId, agentApiKey, state, forceOrchestrator);
 
       // Gemini บางทีคืน empty → retry ด้วย reduced context (ลด history + ตัด memory)
       if (reply === "(no response from Gemini)" || reply === "(no response)") {
@@ -509,29 +599,6 @@ export async function chat(userId: string, message: string, media?: MediaData, o
     reply = await chatAnthropic(message, dbHistory, fullSystemPrompt, userId, media, filteredTools, state);
   }
 
-  // Safety net: orchestrator ตอบเป็นสัญญาแต่ไม่ call tool → retry บังคับให้ call tool
-  // ข้าม safety net สำหรับ audio/video (tools ถูกปิดไว้ — Gemini ตอบตรงๆ)
-  if (isOrchestratorMode && !isDelegate && reply && state.toolCallCount === 0 && !isHeavyMedia(media)) {
-    const promisePattern = /(?:เดี๋ยว|อีก\s*\d|จะ(?:ดึง|หา|ค้น|ส่ง|ทำ|สร้าง|เขียน|เช็ค|ตรวจ|ลอง|แปลง|วิเคราะห์|อ่าน|ดู|เปิด)|ฉันจะ|ผมจะ|รอสักครู่|โปรดรอ|I'll|I will|Let me)/i;
-    const errorPattern = /(?:ไม่สามารถ|ไม่ได้|ดาวน์โหลดไม่|download.?fail|could not|cannot|ขออภัย.*ไม่|ขอโทษ.*ไม่|ไฟล์.*ใหญ่|exceed|limit|too large)/i;
-    // Skip safety net if reply has real content (>80 chars = has actual answer, not just a promise)
-    const hasRealContent = reply.length > 80;
-    if (promisePattern.test(reply) && !errorPattern.test(reply) && !hasRealContent) {
-      console.log(`[AI] Safety net: detected promise without tool call (0 tools called), retrying...`);
-      const retryMsg = `${message}\n\n[SYSTEM: You just responded with a promise but did NOT call any tool. This is WRONG. You MUST call the appropriate tool NOW — use "cron" for scheduled tasks, "delegate_task" for searches/actions. Do NOT respond with text only.]`;
-      try {
-        if (provider === "gemini") {
-          const agentApiKey = activeAgent?.apiKey || undefined;
-          reply = await chatGemini(retryMsg, dbHistory, fullSystemPrompt, userId, media, filteredTools, media, "orchestrator", agentApiKey, state);
-        } else if (provider === "openrouter") {
-          reply = await chatOpenRouter(retryMsg, dbHistory, fullSystemPrompt, userId, media, filteredTools, activeAgent?.model, "orchestrator", state);
-        }
-      } catch (retryErr) {
-        console.log(`[AI] Safety net retry failed:`, retryErr);
-      }
-    }
-  }
-
   // ถ้ามี media → เก็บ user message พร้อม AI description/transcript (เหมือน OpenClaw)
   if (!skip && media) {
     const mediaType = media.mimeType.startsWith("image/") ? "Image"
@@ -541,13 +608,21 @@ export async function chat(userId: string, message: string, media?: MediaData, o
     const desc = reply.length > 2000
       ? reply.substring(0, 2000).replace(/\n/g, " ")
       : reply.replace(/\n/g, " ");
-    saveMessage(userId, "user", `[${mediaType}: ${desc}]`, memoryConfig).catch(console.error);
+    // เก็บ messageId ด้วย (ถ้ามี) เพื่อให้ AI สามารถ reference re-download ได้จาก history
+    const msgIdMatch = message.match(/messageId=(\d+)/);
+    const msgIdPart = msgIdMatch ? ` messageId=${msgIdMatch[1]}` : "";
+    saveMessage(userId, "user", `[${mediaType}${msgIdPart}: ${desc}]`, memoryConfig).catch(console.error);
   }
 
   // Replace technical empty-response messages with user-friendly text
+  // ถ้ามีผลลัพธ์จาก tool อยู่แล้ว (audio/image/video) → ไม่บอก error เพราะงานสำเร็จแล้ว
   if (reply === "(no response from Gemini)" || reply === "(no response)") {
-    reply = "ขอโทษค่ะ ระบบมีปัญหาชั่วคราว ลองส่งข้อความอีกครั้งนะคะ 🙏";
-    console.error(`[AI] Sending friendly error to user (original: empty response)`);
+    if (state.lastAudioResult || state.lastImageUrl || state.lastVideoUrl) {
+      reply = "";  // มีผล → ส่ง media ได้เลย orchestrator จัดการเอง
+    } else {
+      reply = "ขอโทษค่ะ ระบบมีปัญหาชั่วคราว ลองส่งข้อความอีกครั้งนะคะ 🙏";
+      console.error(`[AI] Sending friendly error to user (original: empty response)`);
+    }
   }
 
   // บันทึกคำตอบ AI ลง DB + index เข้า memory (skip สำหรับ background tasks)
@@ -562,6 +637,9 @@ export async function chat(userId: string, message: string, media?: MediaData, o
   }
   if (state.lastImageUrl) {
     result.imageUrl = state.lastImageUrl;
+  }
+  if (state.lastVideoUrl) {
+    result.videoUrl = state.lastVideoUrl;
   }
   return result;
 }
@@ -655,6 +733,7 @@ async function chatGemini(
   agentId?: string,
   overrideApiKey?: string,
   state?: ChatState,
+  forceToolCall?: boolean,
 ): Promise<string> {
   const apiKey = overrideApiKey || getGeminiKey();
   const toolCtx: ToolContext = { userId, agentId, lineClient, media: contextMedia ?? media };
@@ -677,7 +756,7 @@ async function chatGemini(
   // User message + inline media (image/video/audio → Gemini multimodal)
   const userParts: GeminiPart[] = [{ text: message }];
   const GEMINI_INLINE_PREFIXES = ["image/", "video/", "audio/"];
-  if (media && GEMINI_INLINE_PREFIXES.some((p) => media.mimeType.startsWith(p))) {
+  if (media && (GEMINI_INLINE_PREFIXES.some((p) => media.mimeType.startsWith(p)) || media.mimeType === "application/pdf")) {
     userParts.push({ inlineData: { mimeType: media.mimeType, data: media.buffer.toString("base64") } });
   }
   contents.push({ role: "user", parts: userParts });
@@ -705,6 +784,7 @@ async function chatGemini(
       generationConfig: { maxOutputTokens: 8192 },
     };
     if (geminiTools) body.tools = geminiTools;
+    if (geminiTools && forceToolCall) body.tool_config = { function_calling_config: { mode: "ANY" } };
 
     const url = `${GEMINI_BASE_URL}/models/${getGeminiModel()}:generateContent`;
     const res = await fetch(url, {
@@ -758,6 +838,14 @@ async function chatGemini(
         contents.push({ role: "model", parts: retryParts as GeminiPart[] });
         const retryFunctionCalls = retryParts.filter((p) => p.functionCall);
         if (retryFunctionCalls.length > 0) {
+          // respond_directly intercept
+          const rdCall = retryFunctionCalls.find((p) => p.functionCall!.name === "respond_directly");
+          if (rdCall) {
+            lastText = (rdCall.functionCall!.args as { text?: string }).text || "";
+            console.log(`[tool] respond_directly (429-retry) → "${lastText.substring(0, 80)}"`);
+            break;
+          }
+
           const responseParts: GeminiPart[] = [];
           for (const part of retryFunctionCalls) {
             const fc = part.functionCall!;
@@ -825,6 +913,14 @@ async function chatGemini(
     // เช็ค function calls
     const functionCalls = parts.filter((p) => p.functionCall);
     if (functionCalls.length > 0) {
+      // respond_directly → ใช้ text เป็น reply และหยุด loop ทันที
+      const rdCall = functionCalls.find((p) => p.functionCall!.name === "respond_directly");
+      if (rdCall) {
+        lastText = (rdCall.functionCall!.args as { text?: string }).text || "";
+        console.log(`[tool] respond_directly → "${lastText.substring(0, 80)}"`);
+        break;
+      }
+
       const responseParts: GeminiPart[] = [];
       for (const part of functionCalls) {
         const fc = part.functionCall!;
@@ -860,7 +956,11 @@ async function chatGemini(
     break;
   }
 
-  return lastText || "(no response)";
+  // ถ้า model ตอบ empty แต่มีผลลัพธ์จาก tool แล้ว → ไม่ใช่ error
+  if (!lastText && state?.lastAudioResult) lastText = "นี่ค่ะ 🎵";
+  else if (!lastText && state?.lastImageUrl) lastText = "นี่ค่ะ";
+
+  return lastText || "(no response from Gemini)";
 }
 
 // ===== OpenAI-compatible Provider (Ollama / OpenRouter / etc.) =====
@@ -928,6 +1028,14 @@ async function chatOpenAICompat(
       content: [
         { type: "text", text: message },
         { type: "video_url", video_url: { url: `data:${media.mimeType};base64,${media.buffer.toString("base64")}` } },
+      ],
+    });
+  } else if (media && media.mimeType === "application/pdf" && cfg.supportsVision !== false) {
+    messages.push({
+      role: "user",
+      content: [
+        { type: "text", text: message },
+        { type: "image_url", image_url: { url: `data:application/pdf;base64,${media.buffer.toString("base64")}` } },
       ],
     });
   } else {
@@ -1145,7 +1253,7 @@ async function chatAnthropic(
       content: m.content,
     }));
 
-  // User message + inline image (vision)
+  // User message + inline media
   if (media && ANTHROPIC_IMAGE_TYPES.has(media.mimeType)) {
     history.push({
       role: "user",
@@ -1158,6 +1266,21 @@ async function chatAnthropic(
             data: media.buffer.toString("base64"),
           },
         },
+        { type: "text" as const, text: message },
+      ],
+    });
+  } else if (media && media.mimeType === "application/pdf") {
+    history.push({
+      role: "user",
+      content: [
+        {
+          type: "document" as const,
+          source: {
+            type: "base64" as const,
+            media_type: "application/pdf" as const,
+            data: media.buffer.toString("base64"),
+          },
+        } as any,
         { type: "text" as const, text: message },
       ],
     });

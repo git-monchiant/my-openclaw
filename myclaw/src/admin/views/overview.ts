@@ -15,6 +15,10 @@ async function renderOverview(el){
     api('/api/google-users'),
     api('/api/gemini'),
   ]);
+  // Active orchestrator + all candidates for dropdown
+  const allAgents = agentsData.agents || [];
+  const orchCandidates = allAgents.filter(a => a.type === 'orchestrator' || a.type === 'fallback');
+  const activeOrch = allAgents.find(a => a.type === 'orchestrator');
   cachedStatus = status;
   document.getElementById('uptime-text').textContent = 'Up '+status.uptime.human+' | PID '+status.pid;
   updateConnectionBadge(status.sseClients);
@@ -48,8 +52,8 @@ async function renderOverview(el){
     +'</div>';
   }
 
-  // Active agents list
-  const enabledAgents = (agentsData.agents||[]).filter(a=>a.enabled);
+  // Only enabled specialist agents for the badge list
+  const enabledAgents = allAgents.filter(a => a.enabled && a.type === 'agent');
 
   el.innerHTML = \`
     <div class="page-header">
@@ -108,7 +112,31 @@ async function renderOverview(el){
       <div>
         <!-- Orchestrator Panel -->
         <div class="panel">
-          <div class="panel-title">&#x1F3AF; Orchestrator</div>
+          <div class="panel-title" style="display:flex;align-items:center;justify-content:space-between">
+            <span>&#x1F3AF; Orchestrator</span>
+            \${orchCandidates.length > 1
+              ? '<select style="font-size:12px;padding:4px 10px;border:1px solid rgba(255,140,0,.3);border-radius:8px;background:rgba(255,140,0,.08);color:#fff;outline:none;cursor:pointer" onchange="switchOrchestrator(this.value)">'
+                + orchCandidates.map(a=>'<option value="'+esc(a.id)+'"'+(a.type==='orchestrator'?' selected':'')+'>'+esc(a.name)+'</option>').join('')
+                + '</select>'
+              : ''}
+          </div>
+
+          <!-- Active Orchestrator Info -->
+          \${activeOrch ? \`
+          <div style="padding:10px 14px;background:rgba(255,140,0,.06);border:1px solid rgba(255,140,0,.15);border-radius:var(--radius-sm);margin-bottom:16px">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+              <div style="font-size:15px;font-weight:800;color:#fff">\${esc(activeOrch.name)}</div>
+              <div style="display:flex;align-items:center;gap:6px;margin-left:auto">
+                \${badge(activeOrch.provider, pColor(activeOrch.provider))}
+                <code style="font-size:10px;color:var(--text2)">\${esc(activeOrch.model)}</code>
+                <span style="font-size:10px;color:var(--text3)">env key</span>
+              </div>
+            </div>
+            \${(activeOrch.allowedTools||[]).length > 0 ? \`<div style="display:flex;flex-wrap:wrap;gap:4px">
+              \${(activeOrch.allowedTools||[]).map(t=>'<span class="b b-orange" style="font-size:9px;opacity:.8">'+esc(t)+'</span>').join('')}
+            </div>\` : ''}
+          </div>\` : ''}
+
           <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;margin-bottom:16px">
             <div>
               <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Provider</div>
@@ -129,8 +157,7 @@ async function renderOverview(el){
 
           <div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:16px">
             \${enabledAgents.map(a=>
-              '<span class="b b-'+(a.isDefault?'green':'blue')+'" style="font-size:10px">'+esc(a.name)
-              +(a.isDefault?' &#x2605;':'')
+              '<span class="b b-blue" style="font-size:10px">'+esc(a.name)
               +' <span style="opacity:.5">'+(a.skills||[]).length+'</span></span>'
             ).join('')}
           </div>
@@ -210,6 +237,12 @@ async function renderOverview(el){
       loadTab('overview');
     } catch(e){ alert('Error: '+e.message); }
   };
+}
+
+async function switchOrchestrator(id){
+  const r = await api('/api/orchestrator/active','POST',{id});
+  if(r.success){ showToast('Orchestrator switched to '+r.active.name); loadTab('overview'); }
+  else showToast('Error: '+(r.error||'unknown'),'error');
 }
 
 function renderActiveTasksHtml(tasks, queue){

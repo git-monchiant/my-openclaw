@@ -7,12 +7,16 @@ export interface AgentConfig {
   id: string;
   name: string;
   description: string;
+  type: "orchestrator" | "agent" | "fallback";
+  // orchestrator — coordinator only, never delegate-able (id '00')
+  // agent        — specialist, receives delegated tasks via skill matching
+  // fallback     — catch-all when no agent skill matches; NOT a normal agent (future)
   provider: string;       // gemini, anthropic, openai, ollama
   model: string;          // gemini-2.5-flash, claude-sonnet-4, gpt-4o, glm-4.7-flash
   apiKey: string | null;  // per-agent API key (null = ใช้จาก env)
   systemPrompt: string | null; // null = ใช้ default prompt
+  allowedTools: string[] | null; // null = use defaults; only relevant for type='orchestrator'
   enabled: boolean;
-  isDefault: boolean;
   skills?: SkillConfig[];      // populated by join
   createdAt: string;
   updatedAt: string;

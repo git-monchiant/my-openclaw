@@ -7,7 +7,17 @@
  * ใช้ SSE emit ให้ dashboard update แบบ real-time
  */
 
+import fs from "fs";
+import path from "path";
 import { emitDashboardEvent } from "./events.js";
+
+// ===== Trace file persistence =====
+const TRACE_FILE = path.join(process.env.DATA_DIR || "./data", "logs", "traces.jsonl");
+const TRACE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+function appendTraceToFile(trace: ExecutionTrace) {
+  fs.appendFile(TRACE_FILE, JSON.stringify(trace) + "\n", () => {});
+}
 
 // ===== Execution Trace =====
 
@@ -52,6 +62,38 @@ const activeTraces = new Map<string, ExecutionTrace>();  // running traces (by t
 
 const MAX_COMPLETED_TRACES = 100;
 const completedTraces: ExecutionTrace[] = [];  // ring buffer of recent completed traces
+
+// Startup: restore last 24hr of completed traces from file
+(function initTraceFile() {
+  try {
+    fs.mkdirSync(path.dirname(TRACE_FILE), { recursive: true });
+    if (!fs.existsSync(TRACE_FILE)) return;
+    const cutoff = Date.now() - TRACE_MAX_AGE_MS;
+    const lines = fs.readFileSync(TRACE_FILE, "utf8").split("\n").filter(Boolean);
+    const recent: ExecutionTrace[] = [];
+    for (const line of lines) {
+      try {
+        const t = JSON.parse(line) as ExecutionTrace;
+        if (t.startedAt >= cutoff) recent.push(t);
+      } catch { /* skip malformed */ }
+    }
+    // File is oldest-first; reverse → newest-first to match completedTraces order
+    recent.reverse();
+    completedTraces.push(...recent.slice(0, MAX_COMPLETED_TRACES));
+  } catch { /* first run */ }
+})();
+
+// Hourly: trim file to 24hr only
+(function scheduleTraceTrim() {
+  setTimeout(() => {
+    try {
+      const cutoff = Date.now() - TRACE_MAX_AGE_MS;
+      const kept = completedTraces.filter((t) => t.startedAt >= cutoff);
+      fs.writeFileSync(TRACE_FILE, kept.map((t) => JSON.stringify(t)).join("\n") + (kept.length ? "\n" : ""));
+    } catch { /* ignore */ }
+    scheduleTraceTrim();
+  }, 60 * 60 * 1000).unref();
+})();
 
 let traceCounter = 0;
 function genTraceId(): string {
@@ -218,6 +260,7 @@ export function endTask(userId: string, finalResponse?: string): void {
     if (completedTraces.length > MAX_COMPLETED_TRACES) {
       completedTraces.pop();
     }
+    appendTraceToFile(trace);
   }
 
   activeTasks.delete(userId);
