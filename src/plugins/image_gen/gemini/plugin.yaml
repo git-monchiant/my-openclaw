@@ -1,0 +1,7 @@
+name: gemini
+version: 1.0.0
+description: "Google Gemini image generation backend (gemini-2.5-flash-image / 'nano banana'). Text-to-image via the Google AI Studio API key — no extra signup."
+author: family-bot
+kind: backend
+requires_env:
+  - GOOGLE_API_KEY

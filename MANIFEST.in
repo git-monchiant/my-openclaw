@@ -1,0 +1,4 @@
+graft data/skills
+graft data/optional-skills
+global-exclude __pycache__
+global-exclude *.py[cod]

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "additionalDirectories": [],
+    "allow": [
+      "Bash(.venv/bin/python -c ' *)"
+    ]
+  }
+}
