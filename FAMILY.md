@@ -1,7 +1,7 @@
 # Family-bot customizations
 
 > These files are **family-bot customizations** layered on top of upstream **Hermes Agent**.
-> Keep them in mind when merging upstream changes. The bot is the LINE bot **"TT^"** (homework / family assistant).
+> Keep them in mind when merging upstream changes. The bot is the LINE bot **"ตูดตึง"** (homework / family assistant; ex-"TT^"). It runs a **family group of 3** (display names: `array`=student/child, `opor`=mother, third=father). Proactive alerts go out via **LINE Broadcast** (all OA followers), not per-user push.
 > Related: agent memory `family-bot-tools`, `family-bot-line-setup`, `classroom-homework-bot`.
 
 Everything below is native Hermes (tools self-register into `src/tools/registry.py`; scripts run via the Hermes cron runner). Nothing here depends on the old `mybot`/`myclaw` project.
@@ -26,8 +26,8 @@ Each self-registers via `tools.registry.registry.register(name=..., toolset=...)
 | File | Cron job (schedule) | Purpose |
 |------|---------------------|---------|
 | [scripts/family/calendar_auth.py](scripts/family/calendar_auth.py) | — (one-time, manual) | OAuth bootstrap: mint `GOOGLE_CALENDAR_REFRESH_TOKEN` into `~/.hermes/.env` (loopback `http://localhost:8765/`). |
-| [scripts/family/classroom_sync.py](scripts/family/classroom_sync.py) | `tt-classroom-sync` (`*/5 * * * *`) | Fetch Classroom via student Apps Script (`CLASSROOM_SCRIPT_URL`) → write `~/.hermes/data/classroom.db`. **Also pushes a LINE alert (stdout, no_agent) the moment a NEW coursework/announcement appears** — tracked once-only via the `seen_items` table (seeded silently on first run). |
-| [scripts/family/classroom_reminder.py](scripts/family/classroom_reminder.py) | `tt-reminder-morning` (`0 7 * * *`), `tt-reminder-evening` (`0 18 * * *`) | Compact outstanding-work summary → TT^ pushes to LINE. |
+| [scripts/family/classroom_sync.py](scripts/family/classroom_sync.py) | `tt-classroom-sync` (`*/5 * * * *`) | Fetch Classroom via student Apps Script (`CLASSROOM_SCRIPT_URL`) → write `~/.hermes/data/classroom.db`. **The moment a NEW coursework/announcement appears it `_broadcast()`s a full-detail LINE card** (📌 วิชา/หัวข้อ/รายละเอียด/กำหนดส่ง/อาจารย์/ลิงก์ — teacher resolved from `creatorUserId`→teachers, else course teacher). Once-only via the `seen_items` table (seeded silently on first run). |
+| [scripts/family/classroom_reminder.py](scripts/family/classroom_reminder.py) | `tt-reminder-morning` (`0 7 * * *`), `tt-reminder-evening` (`0 18 * * *`) | Outstanding-work summary → `_broadcast()`s to LINE directly (morning/evening greeting picked from the clock). |
 | [scripts/family/classroom_trello_sync.py](scripts/family/classroom_trello_sync.py) | `tt-classroom-trello` (`0 */2 * * *`) | Turn `classroom.db` into cards on the Trello **PDS** board. |
 
 ## Wiring
@@ -44,6 +44,7 @@ Each self-registers via `tools.registry.registry.register(name=..., toolset=...)
 ## Runbook
 
 - **Start the bot:** `./run-tt.sh` (auto ngrok `familybot.ngrok.app` → `:8646`, then `hermes gateway`). Restart after any `~/.hermes/.env` change (env is read at startup).
+- **LINE OA / notifications:** the bot serves **one LINE OA** (`LINE_CHANNEL_ACCESS_TOKEN`/`SECRET` in `.env`; webhook URL `https://familybot.ngrok.app/line/webhook` set in the LINE console). Hermes = 1 OA per gateway. Proactive alerts (new-item + morning/evening) are **LINE Broadcasts** the scripts fire themselves via `POST /v2/bot/message/broadcast` — so all three cron jobs are `no_agent:true, deliver:"local"` with **empty stdout** (broadcast bypasses the cron `deliver` target). Everyone who **adds the OA as a friend** receives them. Free tier = **300 msgs/month**, counted **per recipient** (3 followers × 2 daily summaries ≈ 180/mo, so watch the cap — check `GET /v2/bot/message/quota[/consumption]`). Replies (someone messaging the bot) still go back to wherever they were sent (DM→DM, group→group), automatic.
 - **Calendar (Google API + OAuth):** OAuth app **must be in Production** — in "Testing" mode Google expires the refresh token after 7 days (root cause of past calendar breakage). Client = **Desktop** type, GCP project `290558054599`. Mint/refresh the token with `python scripts/family/calendar_auth.py`. Restricted to 2 calendars via `GOOGLE_CALENDAR_IDS`.
 - **Classroom:** student deploys an Apps Script web app that returns their Classroom JSON; its URL goes in `CLASSROOM_SCRIPT_URL`; `classroom_sync.py` mirrors it to `classroom.db`.
 - **Trello:** API key/token only (no OAuth). Board = **PDS**.

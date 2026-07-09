@@ -53,6 +53,34 @@ def _load_env() -> None:
                 os.environ.setdefault(k.strip(), v.strip())
 
 
+def _broadcast(text: str) -> bool:
+    """Send `text` to ALL followers of the LINE OA (no recipient = broadcast).
+
+    Bypasses the cron ``deliver`` target entirely so the alert reaches every
+    family member who added the OA, not just LINE_HOME_CHANNEL.
+    """
+    token = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
+    if not token:
+        print("[classroom_sync] no LINE_CHANNEL_ACCESS_TOKEN — cannot broadcast", file=sys.stderr)
+        return False
+    msg = text if len(text) <= 4900 else text[:4897] + "…"  # LINE text cap 5000
+    try:
+        r = httpx.post(
+            "https://api.line.me/v2/bot/message/broadcast",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"messages": [{"type": "text", "text": msg}]},
+            timeout=15,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[classroom_sync] broadcast error: {e}", file=sys.stderr)
+        return False
+    if r.status_code == 200:
+        print("[classroom_sync] broadcast ok", file=sys.stderr)
+        return True
+    print(f"[classroom_sync] broadcast failed {r.status_code}: {r.text[:200]}", file=sys.stderr)
+    return False
+
+
 def _db_path() -> Path:
     return Path(os.getenv("CLASSROOM_DB_PATH") or DEFAULT_DB_PATH).expanduser()
 
@@ -217,6 +245,18 @@ def write_mirror(conn: sqlite3.Connection, data: dict, since: str) -> dict[str, 
     }
 
 
+def _fmt_due(due: str | None) -> str:
+    due = (due or "").strip()
+    if not due:
+        return "-"
+    return due.replace("T", " ")[:16]
+
+
+def _clip(s: str | None, n: int) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
 def detect_and_notify(conn: sqlite3.Connection, data: dict, since: str) -> None:
     """Push a LINE alert (via STDOUT — this is a no_agent cron job) the moment a
     NEW coursement/announcement appears. Each id is alerted exactly once.
@@ -225,18 +265,36 @@ def detect_and_notify(conn: sqlite3.Connection, data: dict, since: str) -> None:
     Prints nothing when there's nothing new → cron delivers nothing.
     """
     courses = {c.get("id"): (c.get("name") or "") for c in (data.get("courses") or [])}
+
+    # Teacher lookup: prefer the item's creator, else fall back to the course's
+    # teacher(s). Teachers come as {courseId, userId, profile:{id,name,email}}.
+    teachers = data.get("teachers") or []
+    def _tname(t: dict) -> str:
+        return ((t.get("profile") or {}).get("name") or "").strip()
+    def _tid(t: dict):
+        return (t.get("profile") or {}).get("id") or t.get("userId")
+    teacher_by_uid = {_tid(t): _tname(t) for t in teachers if _tid(t) and _tname(t)}
+    teacher_by_course: dict = {}
+    for t in teachers:
+        nm = _tname(t)
+        if nm:
+            teacher_by_course.setdefault(t.get("courseId"), [])
+            if nm not in teacher_by_course[t.get("courseId")]:
+                teacher_by_course[t.get("courseId")].append(nm)
+
+    def _teacher(item: dict) -> str:
+        nm = teacher_by_uid.get(item.get("creatorUserId"))
+        if nm:
+            return nm
+        names = teacher_by_course.get(item.get("courseId")) or []
+        return ", ".join(names) if names else "-"
+
     cw = [w for w in (data.get("coursework") or []) if _keep_since(w, since, "dueDate", "creationTime")]
     ann = [a for a in (data.get("announcements") or []) if _keep_since(a, since, "creationTime")]
 
-    items = []  # (type, id, course, title, due)
-    for w in cw:
-        items.append(("coursework", w.get("id"), courses.get(w.get("courseId"), ""),
-                      (w.get("title") or "(ไม่มีชื่อ)").strip(), (w.get("dueDate") or "")[:16]))
-    for a in ann:
-        head = (a.get("text") or "").strip().split("\n")[0][:70]
-        items.append(("announcement", a.get("id"), courses.get(a.get("courseId"), ""),
-                      head or "(ประกาศ)", ""))
-    items = [it for it in items if it[1]]  # need an id
+    items = []  # (type, id, raw)
+    items += [("coursework", w.get("id"), w) for w in cw if w.get("id")]
+    items += [("announcement", a.get("id"), a) for a in ann if a.get("id")]
 
     seen = {(r[0], r[1]) for r in conn.execute("SELECT source_type, source_id FROM seen_items")}
     first_run = not seen
@@ -251,16 +309,35 @@ def detect_and_notify(conn: sqlite3.Connection, data: dict, since: str) -> None:
     if first_run or not new:
         return  # silent — no stdout, cron delivers nothing
 
-    lines = ["📢 มีอัปเดตใหม่จาก Classroom ของลูกครับ!", ""]
-    for typ, _id, course, title, due in new[:12]:
+    blocks = []
+    for typ, _id, raw in new[:12]:
+        course = courses.get(raw.get("courseId")) or "-"
+        teacher = _teacher(raw)
+        link = (raw.get("alternateLink") or "").strip() or "-"
         if typ == "coursework":
-            d = f" (ส่ง {due.replace('T', ' ')})" if due else ""
-            lines.append(f"📚 {course}\n   งานใหม่: {title}{d}")
+            blocks.append(
+                "📌 แจ้งงานใหม่\n"
+                f"📚 วิชา : {course}\n"
+                f"📝 หัวข้อ : {_clip(raw.get('title') or '(ไม่มีชื่อ)', 200)}\n"
+                f"📄 รายละเอียด : {_clip(raw.get('description'), 600) or '-'}\n"
+                f"⏰ กำหนดส่ง : {_fmt_due(raw.get('dueDate'))}\n"
+                f"👩‍🏫 อาจารย์ : {teacher}\n"
+                f"🔗 เปิดใบงาน : {link}"
+            )
         else:
-            lines.append(f"📣 {course}\n   ประกาศ: {title}")
+            text = (raw.get("text") or "").strip()
+            blocks.append(
+                "📢 ประกาศใหม่\n"
+                f"📚 วิชา : {course}\n"
+                f"📝 หัวข้อ : {_clip(text.split(chr(10))[0], 120) or '(ประกาศ)'}\n"
+                f"📄 รายละเอียด : {_clip(text, 600) or '-'}\n"
+                f"👩‍🏫 อาจารย์ : {teacher}\n"
+                f"🔗 เปิดดู : {link}"
+            )
+    out = "\n\n────────\n\n".join(blocks)
     if len(new) > 12:
-        lines.append(f"\n…และอีก {len(new) - 12} รายการ")
-    print("\n".join(lines))  # STDOUT → delivered to LINE by the cron runner
+        out += f"\n\n…และอีก {len(new) - 12} รายการ"
+    _broadcast(out)  # → LINE Broadcast API (all followers). stdout stays empty.
 
 
 def main() -> int:
